@@ -14,191 +14,186 @@ const print = debug.print;
 const Allocator = mem.Allocator;
 const TypeInfo = builtin.TypeInfo;
 
-pub fn FieldBools(
-    comptime Struct: type,
-    comptime config: struct {
-        layout: TypeInfo.ContainerLayout = .Auto,
-        default_value: ?bool = false,
-    },
-) type {
-    var info: TypeInfo.Struct = .{
-        .layout = config.layout,
-        .fields = &.{},
-        .decls = &.{},
-        .is_tuple = false,
-    };
-    for (meta.fields(Struct)) |field_info| {
-        info.fields = info.fields ++ [_]TypeInfo.StructField{.{
-            .name = field_info.name,
-            .field_type = bool,
-            .default_value = config.default_value,
-            .is_comptime = false,
-            .alignment = 1, // always 1, because all fields are of type 'bool'.
-        }};
+pub fn Registry(comptime entity_bits: u16, comptime Struct: type) type {
+    assert(entity_bits < @bitSizeOf(usize));
+    if (!trait.is(.Struct)(Struct)) {
+        @compileError("Expected struct type.");
     }
-    return @Type(@unionInit(TypeInfo, "Struct", info));
-}
-
-test "FieldBools" {
-    const Bools = FieldBools(struct { foo: i32, bar: void, baz: bool }, .{});
-    var bools = Bools{};
-
-    bools.bar = true;
-    try testing.expect(!bools.foo);
-    try testing.expect(bools.bar);
-    try testing.expect(!bools.baz);
-}
-
-fn MultiArrayListNoLength(comptime Struct: type) type {
+    
+    const Integer = meta.Int(.unsigned, entity_bits);
     return struct {
         const Self = @This();
-        bytes: [*]align(@alignOf(Struct)) u8 = undefined,
-        capacity: usize = 0,
-
-        const WithLength = std.MultiArrayList(Struct);
-        const Field = WithLength.Field;
-
-        fn fromMultiArrayList(array_list: WithLength) Self {
+        _arena: heap.ArenaAllocator,
+        _graveyard: std.ArrayListUnmanaged(Entity),
+        _store: EntityComponents,
+        
+        pub const ComponentName = meta.FieldEnum(Struct);
+        pub fn ComponentType(comptime name: ComponentName) type {
+            return meta.fieldInfo(Struct, name).field_type;
+        }
+        
+        pub const Entity = enum(Integer) {
+            const Tag = Integer;
+            max = math.maxInt(Integer),
+            _,
+            
+            fn value(entity: Entity) Tag {
+                return @enumToInt(entity);
+            }
+            
+            fn from(val: Tag) Entity {
+                return @intToEnum(Entity, val);
+            }
+        };
+        
+        pub fn init(child_allocator: *Allocator) Self {
             return .{
-                .bytes = array_list.bytes,
-                .capacity = array_list.capacity,
+                ._arena = heap.ArenaAllocator.init(child_allocator),
+                ._graveyard = .{},
+                ._store = .{},
             };
         }
-
-        fn toMutliArrayList(self: *Self, len: usize) WithLength {
-            const result = .{
-                .bytes = self.bytes,
-                .len = len,
-                .capacity = self.capacity,
-            };
-            self.* = undefined;
-            return result;
-        }
-    };
-}
-
-pub fn ComponentStore(comptime ComponentsContainerType: type) type {
-    return struct {
-        const Self = @This();
-        len: usize = 0,
-        bools: BoolsList = .{},
-        components: ComponentsList = .{},
-
-        const BoolsList = MultiArrayListNoLength(Bools);
-        const ComponentsList = MultiArrayListNoLength(ComponentsContainer);
-
-        pub const ComponentsContainer = ComponentsContainerType;
-        pub const Bools = FieldBools(ComponentsContainer, .{});
-
-        pub const ComponentId = meta.FieldEnum(ComponentsContainer);
-        pub fn ComponentType(component: ComponentId) type {
-            return meta.fieldInfo(ComponentsContainer, component).field_type;
-        }
-
-        pub fn deinit(self: *Self, allocator: *Allocator) void {
-            self.bools.toMutliArrayList(self.len).deinit(allocator);
-            self.components.toMutliArrayList(self.len).deinit(allocator);
+        
+        pub fn deinit(self: *Self) void {
+            self._arena.deinit();
             self.* = undefined;
         }
-
-        pub fn resize(self: *Self, allocator: *Allocator, new_len: usize) !void {
-            const old_len = self.len;
-            const added_len = if (new_len > old_len) new_len - old_len else 0;
-
-            self.len = new_len;
-            errdefer self.len = old_len;
-
-            var bools = self.bools.toMutliArrayList(old_len);
-            defer self.bools = MultiArrayListNoLength(Bools).fromMultiArrayList(bools);
-
-            var components = self.components.toMutliArrayList(old_len);
-            defer self.components = MultiArrayListNoLength(ComponentsContainer).fromMultiArrayList(components);
-
-            const maybe_err1 = bools.resize(allocator, new_len);
-            const maybe_err2 = components.resize(allocator, new_len);
-
-            if (maybe_err1) |_| {
-                if (added_len != 0) {
-                    const slice = bools.slice();
-                    inline for (comptime meta.fields(ComponentsContainer)) |field_info| {
-                        const field = @field(BoolsList.Field, field_info.name);
-                        const items = slice.items(field);
-                        mem.set(bool, items[items.len - added_len ..], false);
-                    }
+        
+        pub fn create(self: *Self) !Entity {
+            const allocator: *Allocator = &self._arena.allocator;
+            
+            if (self._graveyard.popOrNull()) |entity| {
+                const slice = self._store.slice();
+                
+                const alive_items = slice.items(.alive);
+                assert(!alive_items[entity.value()]);
+                alive_items[entity.value()] = true;
+                
+                return entity;
+            }
+            
+            if (self._store.len == Entity.value(.max)) {
+                return error.OutOfIds;
+            }
+            
+            const new_id = Entity.from(@intCast(Entity.Tag, self._store.len));
+            try self._store.append(allocator, comptime empty_components: {
+                var empty_components_result: ComponentsWithFlagsPlusAliveFlag = undefined;
+                empty_components_result.alive = true;
+                for (std.enums.values(ComponentName)) |component_name| {
+                    @field(empty_components_result, @tagName(asEnabledFlagName(component_name))) = false;
+                    @field(empty_components_result, @tagName(asComponentName(component_name))) = undefined;
                 }
-            } else |err| return err;
-            return maybe_err2;
+                break :empty_components empty_components_result;
+            });
+            errdefer self._store.resize(allocator, self._store.len - 1) catch unreachable;
+            
+            try self._graveyard.ensureTotalCapacity(allocator, self._store.len);
+            return new_id;
         }
-
-        pub fn has(self: Self, index: usize, comptime component: ComponentId) bool {
-            return self.boolsItems(component)[index];
+        
+        pub fn destroy(self: *Self, entity: Entity) void {
+            assert(self.isValid(entity));
+            assert(self.isAlive(entity));
+            assert(!self.inGraveyard(entity));
+            
+            const slice = self._store.slice();
+            
+            const alive_items = slice.items(.alive);
+            assert(alive_items[entity.value()]);
+            alive_items[entity.value()] = false;
+            
+            inline for (comptime std.enums.values(ComponentName)) |component_name| {
+                slice.items(comptime asEnabledFlagName(component_name))[entity.value()] = false;
+                slice.items(comptime asComponentName(component_name))[entity.value()] = undefined;
+            }
+            
+            self._graveyard.appendAssumeCapacity(entity);
         }
-
-        pub fn get(self: Self, index: usize, comptime component: ComponentId) ?ComponentType(component) {
-            var copy = self;
-            return if (copy.getPtr(index, component)) |ptr| ptr.* else null;
+        
+        pub fn isValid(self: Self, entity: Entity) bool {
+            return entity.value() < self._store.len;
         }
-
-        pub fn getPtr(self: *Self, index: usize, comptime component: ComponentId) ?*ComponentType(component) {
-            assert(index < self.len);
-            if (!self.has(index, component)) return null;
-            return &self.componentsItems(component)[index];
+        
+        pub fn isAlive(self: Self, entity: Entity) bool {
+            return self._store.items(.alive)[entity.value()];
         }
-
-        pub fn emplace(self: *Self, index: usize, comptime component: ComponentId) *ComponentType(component) {
-            assert(index < self.len);
-            self.boolsItems(component)[index] = true;
-            const result = self.getPtr(index, component).?;
-            result.* = undefined;
-            return result;
+        
+        pub fn inGraveyard(self: Self, entity: Entity) bool {
+            const count = mem.count(Entity, self._graveyard.items, &.{ entity });
+            assert(count <= 1);
+            return count == 1;
         }
-
-        pub fn remove(self: *Self, index: usize, comptime component: ComponentId) void {
-            assert(index < self.len);
-            self.getPtr(index, component).?.* = undefined;
-            self.boolsItems(component)[index] = false;
+        
+        const struct_fields = meta.fields(Struct);
+        
+        const ComponentsWithFlagsPlusAliveFlag = ComponentsWithFlagsPlusAliveFlag: {
+            var info: TypeInfo.Struct = .{
+                .layout = .Auto,
+                .fields = &.{},
+                .decls = &.{},
+                .is_tuple = false,
+            };
+            
+            info.fields = info.fields ++ [_]TypeInfo.StructField {
+                .{
+                    .name = "alive",
+                    .field_type = bool,
+                    .default_value = @as(?bool, true),
+                    .is_comptime = false,
+                    .alignment = @alignOf(bool),
+                },
+            };
+            
+            for (struct_fields) |field_info| {
+                info.fields = info.fields ++ [_]TypeInfo.StructField {
+                    .{
+                        .name = field_info.name ++ "_component",
+                        .field_type = field_info.field_type,
+                        .default_value = @as(?field_info.field_type, null),
+                        .is_comptime = false,
+                        .alignment = @alignOf(field_info.field_type),
+                    },
+                    .{
+                        .name = field_info.name ++ "_enabled",
+                        .field_type = bool,
+                        .default_value = @as(?bool, false),
+                        .is_comptime = false,
+                        .alignment = @alignOf(bool),
+                    },
+                };
+            }
+            
+            break :ComponentsWithFlagsPlusAliveFlag @Type(@unionInit(TypeInfo, "Struct", info));
+        };
+        const EntityComponents = std.MultiArrayList(ComponentsWithFlagsPlusAliveFlag);
+        
+        fn asComponentName(comptime name: ComponentName) EntityComponents.Field {
+            return @field(EntityComponents.Field, @tagName(name) ++ "_component");
         }
-
-        fn boolsItems(self: Self, comptime component: ComponentId) []bool {
-            const field = @field(BoolsList.Field, @tagName(component));
-            return self.boolsSlice().items(field);
-        }
-
-        fn componentsItems(self: Self, comptime component: ComponentId) []ComponentType(component) {
-            return self.componentsSlice().items(component);
-        }
-
-        fn boolsSlice(self: Self) BoolsList.WithLength.Slice {
-            var copy = self;
-            return copy.bools.toMutliArrayList(self.len).slice();
-        }
-
-        fn componentsSlice(self: Self) ComponentsList.WithLength.Slice {
-            var copy = self;
-            return copy.components.toMutliArrayList(self.len).slice();
+        
+        fn asEnabledFlagName(comptime name: ComponentName) EntityComponents.Field {
+            return @field(EntityComponents.Field, @tagName(name) ++ "_enabled");
         }
     };
 }
 
-test "ComponentStore" {
-    const Components = struct {
+test "Registry" {
+    const PhysicalComponents = struct {
         position: struct { x: f32, y: f32 },
         velocity: struct { x: f32, y: f32 },
+        size: struct { w: f32, h: f32 },
         mass: struct { value: f32 },
     };
-    var store = ComponentStore(Components){};
-    defer store.deinit(testing.allocator);
-
-    try store.resize(testing.allocator, 3);
-
-    try testing.expect(!store.has(0, .position));
-    try testing.expect(!store.has(0, .velocity));
-    try testing.expect(!store.has(0, .mass));
-
-    store.emplace(0, .position).* = .{ .x = 11, .y = 12 };
-    try testing.expect(store.get(0, .position) != null);
-    try testing.expect(store.get(0, .position).?.x == 11);
-    try testing.expect(store.get(0, .position).?.y == 12);
-    try testing.expect(!store.has(0, .velocity));
-    try testing.expect(!store.has(0, .mass));
+    
+    var reg = Registry(32, PhysicalComponents).init(testing.allocator);
+    defer reg.deinit();
+    
+    const ent1 = try reg.create();
+    reg.destroy(ent1);
+    
+    const ent2 = try reg.create();
+    defer reg.destroy(ent2);
+    try testing.expect(ent1 == ent2);
+    
 }

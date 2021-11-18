@@ -38,9 +38,7 @@ pub fn FieldBools(comptime Struct: type, comptime options: struct {
 }
 
 pub fn Registry(comptime Struct: type) type {
-    if (!trait.is(.Struct)(Struct)) {
-        @compileError("Expected struct type.");
-    }
+    if (!trait.is(.Struct)(Struct)) @compileError("Expected struct type.");
     return struct {
         const Self = @This();
         _arena: heap.ArenaAllocator,
@@ -72,49 +70,49 @@ pub fn Registry(comptime Struct: type) type {
             if (self._graveyard.popOrNull()) |entity| {
                 const slice = self.getSlice();
                 const idx = slice.realIndices()[@enumToInt(entity)];
-                
+
                 assert(!slice.aliveFlags()[idx]);
                 slice.aliveFlags()[idx] = true;
-                
+
                 inline for (comptime std.enums.values(ComponentName)) |component_name| {
                     slice.componentEnabledFlags(component_name)[idx] = false;
                     slice.componentValues(component_name)[idx] = undefined;
                 }
-                
+
                 return entity;
             }
-            
+
             if (self._store.len == math.maxInt(usize)) return error.OutOfIds;
             const new_id = @intToEnum(Entity, self._store.len);
-            
+
             try self._graveyard.ensureTotalCapacity(allocator, self._store.len + 1);
             try self._store.append(allocator, entityDataStructFrom(@enumToInt(new_id), true, undefined, .{}));
-            
+
             return new_id;
         }
-        
+
         pub fn destroy(self: *Self, entity: Entity) void {
             const slice = self.getSlice();
             const idx = slice.realIndices()[@enumToInt(entity)];
-            
+
             assert(slice.aliveFlags()[idx]);
             slice.aliveFlags()[idx] = false;
-            
+
             self._graveyard.appendAssumeCapacity(entity);
         }
-        
+
         pub fn assign(self: *Self, entity: Entity, comptime component: ComponentName) *ComponentType(component) {
             const slice = self.getSlice();
-            
+
             assert(!slice.getEntityComponentEnabledFlagPtr(entity, component).*);
-            
+
             slice.getEntityComponentEnabledFlagPtr(entity, component).* = true;
             const ptr = slice.getEntityComponentValuePtr(entity, component);
-            
+
             ptr.* = undefined;
             return ptr;
         }
-        
+
         pub fn remove(self: *Self, entity: Entity, comptime component: ComponentName) ComponentType(component) {
             const slice = self.getSlice();
             assert(slice.getEntityComponentEnabledFlagPtr(entity, component).*);
@@ -134,7 +132,7 @@ pub fn Registry(comptime Struct: type) type {
         pub fn get(self: Self, entity: Entity, comptime component: ComponentName) ?ComponentType(component) {
             const slice = self.getSlice();
             const idx = slice.realIndices()[@enumToInt(entity)];
-            
+
             if (!slice.componentEnabledFlags(component)[idx]) return null;
             return slice.componentValues(component)[idx];
         }
@@ -142,7 +140,7 @@ pub fn Registry(comptime Struct: type) type {
         pub fn getPtr(self: *Self, entity: Entity, comptime component: ComponentName) ?*ComponentType(component) {
             const slice = self.getSlice();
             const idx = slice.realIndices()[@enumToInt(entity)];
-            
+
             if (!slice.componentEnabledFlags(component)[idx]) return null;
             return &slice.componentValues(component)[idx];
         }
@@ -150,7 +148,7 @@ pub fn Registry(comptime Struct: type) type {
         pub fn getAssume(self: Self, entity: Entity, comptime component: ComponentName) ComponentType(component) {
             const slice = self.getSlice();
             const idx = slice.realIndices()[@enumToInt(entity)];
-            
+
             assert(slice.getEntityComponentEnabledFlagPtr(entity, component).*);
             return slice.componentValues(component)[idx];
         }
@@ -158,7 +156,7 @@ pub fn Registry(comptime Struct: type) type {
         pub fn getPtrAssume(self: *Self, entity: Entity, comptime component: ComponentName) *ComponentType(component) {
             const slice = self.getSlice();
             const idx = slice.realIndices()[@enumToInt(entity)];
-            
+
             assert(slice.getEntityComponentEnabledFlagPtr(entity, component).*);
             return &slice.componentValues(component)[idx];
         }
@@ -248,6 +246,32 @@ pub fn Registry(comptime Struct: type) type {
                 return self._slice.items(.alive);
             }
         };
+
+        /// Invalidates pointers to components
+        /// Does no allocations and does nothing to the passed values themselves,
+        /// only swaps memory.
+        fn swapEntityPositions(self: *Self, entity1: Entity, entity2: Entity) void {
+            const slice = self.getSlice();
+
+            const real_indexes = slice.realIndices();
+            defer mem.swap(usize, &real_indexes[@enumToInt(entity1)], &real_indexes[@enumToInt(entity2)]);
+
+            const entity1_old_idx = real_indexes[@enumToInt(entity1)];
+            const entity2_old_idx = real_indexes[@enumToInt(entity2)];
+
+            inline for (comptime std.enums.values(ComponentName)) |component_name| {
+                const Value = ComponentType(component_name);
+
+                const component_values: []Value = slice.componentValues(component_name);
+                mem.swap(Value, &component_values[entity1_old_idx], &component_values[entity2_old_idx]);
+
+                const component_flags: []bool = slice.componentEnabledFlags(component_name);
+                mem.swap(bool, &component_flags[entity1_old_idx], &component_flags[entity2_old_idx]);
+            }
+
+            const alive_flags = slice.aliveFlags();
+            mem.swap(bool, &alive_flags[entity1_old_idx], &alive_flags[entity2_old_idx]);
+        }
 
         fn getSlice(self: Self) Slice {
             return .{

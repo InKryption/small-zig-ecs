@@ -60,7 +60,7 @@ pub fn Registry(comptime entity_bits: u16, comptime Struct: type) type {
         }
 
         pub fn has(self: Self, entity: Entity, comptime component: ComponentName) bool {
-            return self._store.items(asEnabledFlagName(component))[entity.value()];
+            return self._store.items(comptime asEnabledFlagName(component))[entity.value()];
         }
 
         pub fn create(self: *Self) !Entity {
@@ -117,8 +117,8 @@ pub fn Registry(comptime entity_bits: u16, comptime Struct: type) type {
 
         pub fn assign(self: *Self, entity: Entity, comptime component: ComponentName) *ComponentType(component) {
             const slice = self._store.slice();
-            slice.items(asEnabledFlagName(component))[entity.value()] = true;
-            const ptr = &slice.items(asComponentName(component))[entity.value()];
+            slice.items(comptime asEnabledFlagName(component))[entity.value()] = true;
+            const ptr = &slice.items(comptime asComponentName(component))[entity.value()];
             ptr.* = undefined;
             return ptr;
         }
@@ -130,6 +130,25 @@ pub fn Registry(comptime entity_bits: u16, comptime Struct: type) type {
             const value = ptr.*;
             ptr.* = undefined;
             return value;
+        }
+
+        pub fn get(self: Self, entity: Entity, comptime component: ComponentName) ?ComponentType(component) {
+            if (!self.has(entity, component)) return null;
+            return self.getAssume(entity, component);
+        }
+
+        pub fn getPtr(self: *Self, entity: Entity, comptime component: ComponentName) ?*ComponentType(component) {
+            if (!self.has(entity, component)) return null;
+            return self.getPtrAssume(entity, component);
+        }
+
+        pub fn getAssume(self: Self, entity: Entity, comptime component: ComponentName) ComponentType(component) {
+            var copy = self;
+            return copy.getPtrAssume(entity, component).*;
+        }
+
+        pub fn getPtrAssume(self: *Self, entity: Entity, comptime component: ComponentName) *ComponentType(component) {
+            return &self._store.items(comptime asComponentName(component))[entity.value()];
         }
 
         pub fn isValid(self: Self, entity: Entity) bool {
@@ -211,9 +230,17 @@ test "Registry" {
     defer reg.deinit();
 
     const ent1 = try reg.create();
-    reg.destroy(ent1);
-
+    defer reg.destroy(ent1);
+    
     const ent2 = try reg.create();
     defer reg.destroy(ent2);
-    try testing.expect(ent1 == ent2);
+    
+    reg.assign(ent1, .position).* = .{ .x = 33, .y = 42 };
+    reg.assign(ent2, .velocity).* = .{ .x = 2, .y = 7 };
+    
+    try testing.expectEqual(reg.get(ent1, .position).?.x, 33);
+    try testing.expectEqual(reg.get(ent1, .position).?.y, 42);
+    
+    try testing.expectEqual(reg.get(ent2, .velocity).?.x, 2);
+    try testing.expectEqual(reg.get(ent2, .velocity).?.y, 7);
 }

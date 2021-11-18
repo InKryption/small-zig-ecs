@@ -279,7 +279,12 @@ pub fn Registry(comptime Struct: type) type {
             };
         }
 
-        fn entityDataStructFrom(real_index: usize, alive: bool, components: Struct, flags: FieldBools(Struct, .{ .layout = .Packed, .default_value = false })) EntityDataStruct {
+        fn entityDataStructFrom(
+            real_index: usize,
+            alive: bool,
+            components: Struct,
+            flags: FieldBools(Struct, .{ .layout = .Packed, .default_value = false }),
+        ) EntityDataStruct {
             var result: EntityDataStruct = undefined;
 
             result.real_index = real_index;

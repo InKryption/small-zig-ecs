@@ -60,7 +60,7 @@ pub fn Registry(comptime entity_bits: u16, comptime Struct: type) type {
             max = math.maxInt(Integer),
             _,
 
-            fn value(entity: Entity) Tag {
+            fn indexValue(entity: Entity) Tag {
                 return @enumToInt(entity);
             }
 
@@ -83,7 +83,7 @@ pub fn Registry(comptime entity_bits: u16, comptime Struct: type) type {
         }
 
         pub fn has(self: Self, entity: Entity, comptime component: ComponentName) bool {
-            return self._store.items(comptime asComponentEnabledFieldName(component))[entity.value()];
+            return self._store.items(comptime asComponentEnabledFieldName(component))[entity.indexValue()];
         }
 
         pub fn create(self: *Self) !Entity {
@@ -93,13 +93,13 @@ pub fn Registry(comptime entity_bits: u16, comptime Struct: type) type {
                 const slice = self._store.slice();
 
                 const alive_items = slice.items(.alive);
-                assert(!alive_items[entity.value()]);
-                alive_items[entity.value()] = true;
+                assert(!alive_items[entity.indexValue()]);
+                alive_items[entity.indexValue()] = true;
 
                 return entity;
             }
 
-            if (self._store.len == Entity.value(.max)) {
+            if (self._store.len == Entity.indexValue(.max)) {
                 return error.OutOfIds;
             }
 
@@ -116,35 +116,39 @@ pub fn Registry(comptime entity_bits: u16, comptime Struct: type) type {
             assert(self.isAlive(entity));
             assert(!self.inGraveyard(entity));
 
-            const slice = self._store.slice();
-
-            const alive_items = slice.items(.alive);
-            assert(alive_items[entity.value()]);
-            alive_items[entity.value()] = false;
-
+            const slice = self.getSlice();
+            slice.aliveStates()[entity.indexValue()] = false;
             inline for (comptime std.enums.values(ComponentName)) |component_name| {
-                slice.items(comptime asComponentEnabledFieldName(component_name))[entity.value()] = false;
-                slice.items(comptime asComponentValueFieldName(component_name))[entity.value()] = undefined;
+                slice.flagStates(component_name)[entity.indexValue()] = false;
+                slice.values(component_name)[entity.indexValue()] = undefined;
             }
 
             self._graveyard.appendAssumeCapacity(entity);
         }
 
         pub fn assign(self: *Self, entity: Entity, comptime component: ComponentName) *ComponentType(component) {
-            const slice = self._store.slice();
-            slice.items(comptime asComponentEnabledFieldName(component))[entity.value()] = true;
-            const ptr = &slice.items(comptime asComponentValueFieldName(component))[entity.value()];
+            const slice = self.getSlice();
+
+            assert(!slice.flagStates(component)[entity.indexValue()]);
+            slice.flagStates(component)[entity.indexValue()] = true;
+
+            const ptr = &slice.values(component)[entity.indexValue()];
             ptr.* = undefined;
+
             return ptr;
         }
 
         pub fn remove(self: *Self, entity: Entity, comptime component: ComponentName) ComponentType(component) {
-            const slice = self._store.slice();
-            slice.items(asComponentEnabledFieldName(component))[entity.value()] = false;
-            const ptr = &slice.items(asComponentValueFieldName(component))[entity.value()];
-            const value = ptr.*;
+            const slice = self.getSlice();
+
+            assert(slice.flagStates(component)[entity.indexValue()]);
+            slice.flagStates(component)[entity.indexValue()] = false;
+
+            const ptr = &slice.values(component)[entity.indexValue()];
+            const val = ptr.*;
+
             ptr.* = undefined;
-            return value;
+            return val;
         }
 
         pub fn get(self: Self, entity: Entity, comptime component: ComponentName) ?ComponentType(component) {
@@ -163,15 +167,15 @@ pub fn Registry(comptime entity_bits: u16, comptime Struct: type) type {
         }
 
         pub fn getPtrAssume(self: *Self, entity: Entity, comptime component: ComponentName) *ComponentType(component) {
-            return &self._store.items(comptime asComponentValueFieldName(component))[entity.value()];
+            return &self.getSlice().values(component)[entity.indexValue()];
         }
 
         pub fn isValid(self: Self, entity: Entity) bool {
-            return entity.value() < self._store.len;
+            return entity.indexValue() < self._store.len;
         }
 
         pub fn isAlive(self: Self, entity: Entity) bool {
-            return self._store.items(.alive)[entity.value()];
+            return self.getSlice().aliveStates()[entity.indexValue()];
         }
 
         pub fn inGraveyard(self: Self, entity: Entity) bool {
@@ -220,6 +224,28 @@ pub fn Registry(comptime entity_bits: u16, comptime Struct: type) type {
             break :EntityDataStruct @Type(@unionInit(TypeInfo, "Struct", info));
         };
 
+        const Slice = struct {
+            _slice: EntityComponentsStore.Slice,
+
+            fn values(self: Slice, comptime component: ComponentName) []ComponentType(component) {
+                return self._slice.items(comptime asComponentValueFieldName(component));
+            }
+
+            fn flagStates(self: Slice, comptime component: ComponentName) []bool {
+                return self._slice.items(comptime asComponentEnabledFieldName(component));
+            }
+
+            fn aliveStates(self: Slice) []bool {
+                return self._slice.items(.alive);
+            }
+        };
+
+        fn getSlice(self: Self) Slice {
+            return .{
+                ._slice = self._store.slice(),
+            };
+        }
+
         fn entityDataStructFrom(alive: bool, components: Struct, flags: ComponentFlags) EntityDataStruct {
             var result: EntityDataStruct = undefined;
 
@@ -254,7 +280,7 @@ test "Registry" {
         position: struct { x: f32, y: f32 },
         velocity: struct { x: f32, y: f32 },
         size: struct { w: f32, h: f32 },
-        mass: struct { value: f32 },
+        mass: struct { indexValue: f32 },
     };
 
     var reg = Registry(32, PhysicalComponents).init(testing.allocator);
@@ -279,4 +305,7 @@ test "Registry" {
 
     try testing.expectEqual(reg.get(ent2, .velocity).?.x, 2);
     try testing.expectEqual(reg.get(ent2, .velocity).?.y, 7);
+
+    _ = reg.remove(ent1, .position);
+    try testing.expect(!reg.has(ent1, .position));
 }

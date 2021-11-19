@@ -218,26 +218,26 @@ pub fn BasicRegistry(comptime Struct: type) type {
 
             assert(alive_flags[real_idx]);
             assert(components.enabled_flags[real_idx]);
-            
+
             components.enabled_flags[real_idx] = false;
             components.values[real_idx] = undefined;
         }
-        
+
         pub fn removeMany(self: *Self, entities: []const Entity, comptime component: ComponentName) void {
             const slice = self.getSlice();
             const real_indices = slice.realIndices();
             const alive_flags = slice.aliveFlags();
             const components = slice.componentArrays(component);
-            
+
             for (entities) |entity| {
                 assert(self.entityIsValid(entity));
                 assert(!self.entityIsInGraveyard(entity));
-                
+
                 const real_idx = real_indices[@enumToInt(entity)];
-                
+
                 assert(alive_flags[real_idx]);
                 assert(components.enabled_flags[real_idx]);
-                
+
                 components.enabled_flags[real_idx] = false;
                 components.values[real_idx] = undefined;
             }
@@ -291,6 +291,32 @@ pub fn BasicRegistry(comptime Struct: type) type {
 
             assert(slice.componentEnabledFlags(component)[real_idx]);
             return &slice.componentValues(component)[real_idx];
+        }
+
+        /// Invalidates pointers to components
+        /// Does no allocations and does nothing to the passed values themselves,
+        /// only swaps memory values.
+        pub fn swapEntityPositions(self: *Self, entity1: Entity, entity2: Entity) void {
+            const slice = self.getSlice();
+
+            const real_indexes = slice.realIndices();
+            defer mem.swap(usize, &real_indexes[@enumToInt(entity1)], &real_indexes[@enumToInt(entity2)]);
+
+            const entity1_old_idx = real_indexes[@enumToInt(entity1)];
+            const entity2_old_idx = real_indexes[@enumToInt(entity2)];
+
+            inline for (comptime std.enums.values(ComponentName)) |component_name| {
+                const Value = ComponentType(component_name);
+
+                const component_values: []Value = slice.componentValues(component_name);
+                mem.swap(Value, &component_values[entity1_old_idx], &component_values[entity2_old_idx]);
+
+                const component_flags: []bool = slice.componentEnabledFlags(component_name);
+                mem.swap(bool, &component_flags[entity1_old_idx], &component_flags[entity2_old_idx]);
+            }
+
+            const alive_flags = slice.aliveFlags();
+            mem.swap(bool, &alive_flags[entity1_old_idx], &alive_flags[entity2_old_idx]);
         }
 
         fn entityIsValid(self: Self, entity: Entity) bool {
@@ -384,32 +410,6 @@ pub fn BasicRegistry(comptime Struct: type) type {
                 return self._slice.items(.alive);
             }
         };
-
-        /// Invalidates pointers to components
-        /// Does no allocations and does nothing to the passed values themselves,
-        /// only swaps memory values.
-        pub fn swapEntityPositions(self: *Self, entity1: Entity, entity2: Entity) void {
-            const slice = self.getSlice();
-
-            const real_indexes = slice.realIndices();
-            defer mem.swap(usize, &real_indexes[@enumToInt(entity1)], &real_indexes[@enumToInt(entity2)]);
-
-            const entity1_old_idx = real_indexes[@enumToInt(entity1)];
-            const entity2_old_idx = real_indexes[@enumToInt(entity2)];
-
-            inline for (comptime std.enums.values(ComponentName)) |component_name| {
-                const Value = ComponentType(component_name);
-
-                const component_values: []Value = slice.componentValues(component_name);
-                mem.swap(Value, &component_values[entity1_old_idx], &component_values[entity2_old_idx]);
-
-                const component_flags: []bool = slice.componentEnabledFlags(component_name);
-                mem.swap(bool, &component_flags[entity1_old_idx], &component_flags[entity2_old_idx]);
-            }
-
-            const alive_flags = slice.aliveFlags();
-            mem.swap(bool, &alive_flags[entity1_old_idx], &alive_flags[entity2_old_idx]);
-        }
 
         fn getSlice(self: Self) Slice {
             return .{

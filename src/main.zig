@@ -388,7 +388,7 @@ pub fn BasicRegistry(comptime Struct: type) type {
         /// Invalidates pointers to components
         /// Does no allocations and does nothing to the passed values themselves,
         /// only swaps memory values.
-        fn swapEntityPositions(self: *Self, entity1: Entity, entity2: Entity) void {
+        pub fn swapEntityPositions(self: *Self, entity1: Entity, entity2: Entity) void {
             const slice = self.getSlice();
 
             const real_indexes = slice.realIndices();

@@ -111,7 +111,6 @@ pub fn Registry(comptime Struct: type) type {
                         slice.componentEnabledFlags(component_name)[idx] = false;
                         slice.componentValues(component_name)[idx] = undefined;
                     }
-
                     buff[buff_idx] = entity;
                 }
             }

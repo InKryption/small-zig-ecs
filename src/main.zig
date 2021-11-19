@@ -165,10 +165,10 @@ pub fn Registry(comptime Struct: type) type {
         pub fn assign(self: *Self, entity: Entity, comptime component: ComponentName) *ComponentType(component) {
             const slice = self.getSlice();
 
-            assert(!slice.getEntityComponentEnabledFlagPtr(entity, component).*);
+            assert(!slice.entityComponentEnabledFlagPtr(entity, component).*);
 
-            slice.getEntityComponentEnabledFlagPtr(entity, component).* = true;
-            const ptr = slice.getEntityComponentValuePtr(entity, component);
+            slice.entityComponentEnabledFlagPtr(entity, component).* = true;
+            const ptr = slice.entityComponentValuePtr(entity, component);
 
             ptr.* = undefined;
             return ptr;
@@ -176,10 +176,10 @@ pub fn Registry(comptime Struct: type) type {
 
         pub fn remove(self: *Self, entity: Entity, comptime component: ComponentName) ComponentType(component) {
             const slice = self.getSlice();
-            assert(slice.getEntityComponentEnabledFlagPtr(entity, component).*);
+            assert(slice.entityComponentEnabledFlagPtr(entity, component).*);
 
-            slice.getEntityComponentEnabledFlagPtr(entity, component).* = false;
-            const ptr = slice.getEntityComponentValuePtr(entity, component);
+            slice.entityComponentEnabledFlagPtr(entity, component).* = false;
+            const ptr = &slice.entityComponentValuePtr(entity, component);
             const val = ptr.*;
 
             ptr.* = undefined;
@@ -187,7 +187,7 @@ pub fn Registry(comptime Struct: type) type {
         }
 
         pub fn has(self: Self, entity: Entity, comptime component: ComponentName) bool {
-            return self.getSlice().getEntityComponentEnabledFlagPtr(entity, component).*;
+            return self.getSlice().entityComponentEnabledFlagPtr(entity, component).*;
         }
 
         pub fn get(self: Self, entity: Entity, comptime component: ComponentName) ?ComponentType(component) {
@@ -210,7 +210,7 @@ pub fn Registry(comptime Struct: type) type {
             const slice = self.getSlice();
             const idx = slice.realIndices()[@enumToInt(entity)];
 
-            assert(slice.getEntityComponentEnabledFlagPtr(entity, component).*);
+            assert(slice.entityComponentEnabledFlagPtr(entity, component).*);
             return slice.componentValues(component)[idx];
         }
 
@@ -218,7 +218,7 @@ pub fn Registry(comptime Struct: type) type {
             const slice = self.getSlice();
             const idx = slice.realIndices()[@enumToInt(entity)];
 
-            assert(slice.getEntityComponentEnabledFlagPtr(entity, component).*);
+            assert(slice.entityComponentEnabledFlagPtr(entity, component).*);
             return &slice.componentValues(component)[idx];
         }
 
@@ -275,22 +275,22 @@ pub fn Registry(comptime Struct: type) type {
         const Slice = struct {
             _slice: EntityComponentsStore.Slice,
 
-            fn getEntityComponentValuePtr(self: Slice, entity: Entity, comptime component: ComponentName) *ComponentType(component) {
-                const idx = self.getEntityRealIndexPtr(entity).*;
+            fn entityComponentValuePtr(self: Slice, entity: Entity, comptime component: ComponentName) *ComponentType(component) {
+                const idx = self.entityRealIndexPtr(entity).*;
                 return &self.componentValues(component)[idx];
             }
 
-            fn getEntityComponentEnabledFlagPtr(self: Slice, entity: Entity, comptime component: ComponentName) *bool {
-                const idx = self.getEntityRealIndexPtr(entity).*;
+            fn entityComponentEnabledFlagPtr(self: Slice, entity: Entity, comptime component: ComponentName) *bool {
+                const idx = self.entityRealIndexPtr(entity).*;
                 return &self.componentEnabledFlags(component)[idx];
             }
 
-            fn getEntityAliveFlagPtr(self: Slice, entity: Entity) *bool {
-                const idx = self.getEntityRealIndexPtr(entity).*;
+            fn entityAliveFlagPtr(self: Slice, entity: Entity) *bool {
+                const idx = self.entityRealIndexPtr(entity).*;
                 return &self.aliveFlags()[idx];
             }
 
-            fn getEntityRealIndexPtr(self: Slice, entity: Entity) *usize {
+            fn entityRealIndexPtr(self: Slice, entity: Entity) *usize {
                 const idx = @enumToInt(entity);
                 return &self.realIndices()[idx];
             }

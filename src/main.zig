@@ -37,7 +37,7 @@ pub fn FieldBools(comptime Struct: type, comptime options: struct {
     return @Type(@unionInit(TypeInfo, "Struct", info));
 }
 
-pub fn Registry(comptime Struct: type) type {
+pub fn BasicRegistry(comptime Struct: type) type {
     if (!trait.is(.Struct)(Struct)) @compileError("Expected struct type.");
     return struct {
         const Self = @This();
@@ -169,44 +169,78 @@ pub fn Registry(comptime Struct: type) type {
             self._graveyard.appendSliceAssumeCapacity(entities);
         }
 
-        pub fn assign(self: *Self, entity: Entity, comptime component: ComponentName) *ComponentType(component) {
+        pub fn assign(self: *Self, entity: Entity, comptime component: ComponentName, value: ComponentType(component)) void {
             assert(self.entityIsValid(entity));
             assert(!self.entityIsInGraveyard(entity));
 
             const slice = self.getSlice();
             const real_indices = slice.realIndices();
-            const component_enabled_flags = slice.componentEnabledFlags(component);
-            const component_values = slice.componentValues(component);
+            const alive_flags = slice.aliveFlags();
+            const components = slice.componentArrays(component);
 
             const real_idx = real_indices[@enumToInt(entity)];
+            assert(alive_flags[real_idx]);
+            assert(!components.enabled_flags[real_idx]);
 
-            assert(!component_enabled_flags[real_idx]);
-            component_enabled_flags[real_idx] = true;
-
-            const ptr = &component_values[real_idx];
-            ptr.* = undefined;
-
-            return ptr;
+            components.enabled_flags[real_idx] = true;
+            components.values[real_idx] = value;
         }
 
-        pub fn remove(self: *Self, entity: Entity, comptime component: ComponentName) ComponentType(component) {
+        pub fn assignMany(self: *Self, entities: []const Entity, comptime component: ComponentName, value: ComponentType(component)) void {
+            const slice = self.getSlice();
+            const real_indices = slice.realIndices();
+            const alive_flags = slice.aliveFlags();
+            const components = slice.componentArrays(component);
+
+            for (entities) |entity| {
+                assert(self.entityIsValid(entity));
+                assert(!self.entityIsInGraveyard(entity));
+
+                const real_idx = real_indices[@enumToInt(entity)];
+                assert(alive_flags[real_idx]);
+                assert(!components.enabled_flags[real_idx]);
+
+                components.enabled_flags[real_idx] = true;
+                components.values[real_idx] = value;
+            }
+        }
+
+        pub fn remove(self: *Self, entity: Entity, comptime component: ComponentName) void {
             assert(self.entityIsValid(entity));
             assert(!self.entityIsInGraveyard(entity));
 
             const slice = self.getSlice();
-            const real_indicies = slice.realIndices();
-            const component_enabled_flags = slice.componentEnabledFlags(component);
-            const component_values = slice.componentValues(component);
+            const real_indices = slice.realIndices();
+            const alive_flags = slice.aliveFlags();
+            const components = slice.componentArrays(component);
 
-            const real_idx = real_indicies[@enumToInt(entity)];
+            const real_idx = real_indices[@enumToInt(entity)];
 
-            assert(component_enabled_flags[real_idx]);
-            component_enabled_flags[real_idx] = false;
-
-            const val = component_values[real_idx];
-            component_values[real_idx] = undefined;
-
-            return val;
+            assert(alive_flags[real_idx]);
+            assert(components.enabled_flags[real_idx]);
+            
+            components.enabled_flags[real_idx] = false;
+            components.values[real_idx] = undefined;
+        }
+        
+        pub fn removeMany(self: *Self, entities: []const Entity, comptime component: ComponentName) void {
+            const slice = self.getSlice();
+            const real_indices = slice.realIndices();
+            const alive_flags = slice.aliveFlags();
+            const components = slice.componentArrays(component);
+            
+            for (entities) |entity| {
+                assert(self.entityIsValid(entity));
+                assert(!self.entityIsInGraveyard(entity));
+                
+                const real_idx = real_indices[@enumToInt(entity)];
+                
+                assert(alive_flags[real_idx]);
+                assert(components.enabled_flags[real_idx]);
+                
+                components.enabled_flags[real_idx] = false;
+                components.values[real_idx] = undefined;
+            }
         }
 
         pub fn has(self: Self, entity: Entity, comptime component: ComponentName) bool {
@@ -321,6 +355,19 @@ pub fn Registry(comptime Struct: type) type {
         const Slice = struct {
             _slice: EntityComponentsStore.Slice,
 
+            fn componentArrays(
+                self: Slice,
+                comptime component: ComponentName,
+            ) struct {
+                values: []ComponentType(component),
+                enabled_flags: []bool,
+            } {
+                return .{
+                    .values = self.componentValues(component),
+                    .enabled_flags = self.componentEnabledFlags(component),
+                };
+            }
+
             fn componentValues(self: Slice, comptime component: ComponentName) []ComponentType(component) {
                 return self._slice.items(comptime asComponentValueFieldName(component));
             }
@@ -340,7 +387,7 @@ pub fn Registry(comptime Struct: type) type {
 
         /// Invalidates pointers to components
         /// Does no allocations and does nothing to the passed values themselves,
-        /// only swaps memory.
+        /// only swaps memory values.
         fn swapEntityPositions(self: *Self, entity1: Entity, entity2: Entity) void {
             const slice = self.getSlice();
 
@@ -405,7 +452,7 @@ pub fn Registry(comptime Struct: type) type {
     };
 }
 
-test "Registry" {
+test "BasicRegistry" {
     const PhysicalComponents = struct {
         position: struct { x: f32, y: f32 },
         velocity: struct { x: f32, y: f32 },
@@ -413,7 +460,7 @@ test "Registry" {
         mass: struct { value: f32 },
     };
 
-    const Reg = Registry(PhysicalComponents);
+    const Reg = BasicRegistry(PhysicalComponents);
 
     var reg = Reg.init(testing.allocator);
     defer reg.deinit();

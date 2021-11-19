@@ -65,14 +65,16 @@ pub fn Registry(comptime Struct: type) type {
         }
 
         pub fn create(self: *Self) !Entity {
-            const allocator = &self._arena.allocator;
+            const allocator: *Allocator = &self._arena.allocator;
 
             if (self._graveyard.popOrNull()) |entity| {
                 const slice = self.getSlice();
+                const alive_flags = slice.aliveFlags();
+
                 const idx = slice.realIndices()[@enumToInt(entity)];
 
-                assert(!slice.aliveFlags()[idx]);
-                slice.aliveFlags()[idx] = true;
+                assert(!alive_flags[idx]);
+                alive_flags[idx] = true;
 
                 inline for (comptime std.enums.values(ComponentName)) |component_name| {
                     slice.componentEnabledFlags(component_name)[idx] = false;
@@ -91,14 +93,74 @@ pub fn Registry(comptime Struct: type) type {
             return new_id;
         }
 
+        pub fn createMany(self: *Self, buff: []Entity) !void {
+            const allocator: *Allocator = &self._arena.allocator;
+
+            const slice = self.getSlice();
+            const real_indices = slice.realIndices();
+            const alive_flags = slice.aliveFlags();
+
+            if (self._graveyard.items.len != 0) {
+                for (self._graveyard.items[0..math.clamp(buff.len, 0, self._graveyard.items.len)]) |entity, buff_idx| {
+                    const idx = real_indices[@enumToInt(entity)];
+
+                    assert(!alive_flags[idx]);
+                    alive_flags[idx] = true;
+
+                    inline for (comptime std.enums.values(ComponentName)) |component_name| {
+                        slice.componentEnabledFlags(component_name)[idx] = false;
+                        slice.componentValues(component_name)[idx] = undefined;
+                    }
+
+                    buff[buff_idx] = entity;
+                }
+            }
+
+            if (self._graveyard.items.len >= buff.len) {
+                self._graveyard.resize(allocator, 0) catch unreachable;
+                return;
+            }
+
+            const remaining_buff = buff[self._graveyard.items.len..];
+            self._graveyard.resize(allocator, 0) catch unreachable;
+
+            if (self._store.len + (remaining_buff.len - 1) == math.maxInt(usize)) return error.OutOfIds;
+            try self._graveyard.ensureTotalCapacity(allocator, self._store.len + remaining_buff.len);
+            try self._store.ensureUnusedCapacity(allocator, remaining_buff.len);
+
+            for (remaining_buff) |*buff_item| {
+                const new_id = @intToEnum(Entity, self._store.len);
+                self._store.appendAssumeCapacity(entityDataStructFrom(@enumToInt(new_id), true, undefined, .{}));
+                buff_item.* = new_id;
+            }
+        }
+
         pub fn destroy(self: *Self, entity: Entity) void {
+            assert(self.isValidEntity(entity));
             const slice = self.getSlice();
             const idx = slice.realIndices()[@enumToInt(entity)];
 
-            assert(slice.aliveFlags()[idx]);
-            slice.aliveFlags()[idx] = false;
+            const alive_flags = slice.aliveFlags();
+            assert(alive_flags[idx]);
+            alive_flags[idx] = false;
 
             self._graveyard.appendAssumeCapacity(entity);
+        }
+
+        pub fn destroyMany(self: *Self, entities: []const Entity) void {
+            assert(entities.len <= self._store.len);
+            const slice = self.getSlice();
+
+            const alive_flags = slice.aliveFlags();
+            for (entities) |entity| {
+                assert(self.isValidEntity(entity));
+
+                const idx = slice.realIndices()[@enumToInt(entity)];
+                assert(alive_flags[idx]);
+                alive_flags[idx] = false;
+            }
+
+            self._graveyard.appendSliceAssumeCapacity(entities);
         }
 
         pub fn assign(self: *Self, entity: Entity, comptime component: ComponentName) *ComponentType(component) {
@@ -159,6 +221,10 @@ pub fn Registry(comptime Struct: type) type {
 
             assert(slice.getEntityComponentEnabledFlagPtr(entity, component).*);
             return &slice.componentValues(component)[idx];
+        }
+
+        fn isValidEntity(self: Self, entity: Entity) bool {
+            return @enumToInt(entity) < self._store.len;
         }
 
         const EntityComponentsStore = std.MultiArrayList(EntityDataStruct);
@@ -322,29 +388,15 @@ test "Registry" {
         mass: struct { value: f32 },
     };
 
-    var reg = Registry(PhysicalComponents).init(testing.allocator);
+    const Reg = Registry(PhysicalComponents);
+
+    var reg = Reg.init(testing.allocator);
     defer reg.deinit();
 
-    const ent1 = try reg.create();
-    defer reg.destroy(ent1);
-
-    const ent2 = try reg.create();
-    defer reg.destroy(ent2);
-
-    reg.assign(ent1, .position).* = .{ .x = 33, .y = 42 };
-    reg.assign(ent2, .velocity).* = .{ .x = 2, .y = 7 };
-
-    try testing.expect(reg.has(ent1, .position));
-    try testing.expect(reg.has(ent2, .velocity));
-    try testing.expect(!reg.has(ent1, .size));
-    try testing.expect(!reg.has(ent2, .mass));
-
-    try testing.expectEqual(reg.get(ent1, .position).?.x, 33);
-    try testing.expectEqual(reg.get(ent1, .position).?.y, 42);
-
-    try testing.expectEqual(reg.get(ent2, .velocity).?.x, 2);
-    try testing.expectEqual(reg.get(ent2, .velocity).?.y, 7);
-
-    _ = reg.remove(ent1, .position);
-    try testing.expect(!reg.has(ent1, .position));
+    const entities: [2]Reg.Entity = entities: {
+        var entities_array: [2]Reg.Entity = undefined;
+        try reg.createMany(&entities_array);
+        break :entities entities_array;
+    };
+    defer reg.destroyMany(&entities);
 }

@@ -58,7 +58,7 @@ pub fn BasicRegistry(comptime Struct: type) type {
             var _graveyard = try std.ArrayListUnmanaged(Entity).initCapacity(allocator, capacity);
             errdefer _graveyard.deinit(allocator);
 
-            return .{
+            return Self{
                 ._store = _store,
                 ._graveyard = _graveyard,
             };

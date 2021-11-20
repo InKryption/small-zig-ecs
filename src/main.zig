@@ -71,29 +71,9 @@ pub fn BasicRegistry(comptime Struct: type) type {
         }
 
         pub fn create(self: *Self, allocator: *Allocator) !Entity {
-            if (self._graveyard.popOrNull()) |entity| {
-                const slice = self.getSlice();
-                const alive_flags = slice.aliveFlags();
-
-                const idx = slice.realIndices()[@enumToInt(entity)];
-
-                assert(!alive_flags[idx]);
-                alive_flags[idx] = true;
-
-                inline for (comptime std.enums.values(ComponentName)) |component_name| {
-                    slice.componentEnabledFlags(component_name)[idx] = false;
-                    slice.componentValues(component_name)[idx] = undefined;
-                }
-
-                return entity;
-            }
-
-            const new_id = @intToEnum(Entity, self._store.len);
-
-            try self._graveyard.ensureTotalCapacity(allocator, self._store.len + 1);
-            try self._store.append(allocator, entityDataStructFrom(@enumToInt(new_id), true, undefined, .{}));
-
-            return new_id;
+            var result = [1]Entity{undefined};
+            try self.createMany(allocator, &result);
+            return result[0];
         }
 
         pub fn createMany(self: *Self, allocator: *Allocator, buff: []Entity) !void {
@@ -142,17 +122,7 @@ pub fn BasicRegistry(comptime Struct: type) type {
         }
 
         pub fn destroy(self: *Self, entity: Entity) void {
-            assert(self.entityIsValid(entity));
-            assert(!self.entityIsInGraveyard(entity));
-
-            const slice = self.getSlice();
-            const idx = slice.realIndices()[@enumToInt(entity)];
-
-            const alive_flags = slice.aliveFlags();
-            assert(alive_flags[idx]);
-            alive_flags[idx] = false;
-
-            self._graveyard.appendAssumeCapacity(entity);
+            self.destroyMany(&.{entity});
         }
 
         pub fn destroyMany(self: *Self, entities: []const Entity) void {

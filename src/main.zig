@@ -50,6 +50,20 @@ pub fn BasicRegistry(comptime Struct: type) type {
             return meta.fieldInfo(Struct, name).field_type;
         }
 
+        pub fn initCapacity(allocator: *Allocator, capacity: usize) !Self {
+            var _store = EntityComponentsStore{};
+            errdefer _store.deinit(allocator);
+            try _store.ensureTotalCapacity(allocator, capacity);
+
+            var _graveyard = try std.ArrayListUnmanaged(Entity).initCapacity(allocator, capacity);
+            errdefer _graveyard.deinit(allocator);
+
+            return .{
+                ._store = _store,
+                ._graveyard = _graveyard,
+            };
+        }
+
         pub fn deinit(self: *Self, allocator: *Allocator) void {
             self._store.deinit(allocator);
             self._graveyard.deinit(allocator);
@@ -495,7 +509,7 @@ test "BasicRegistry" {
     const Reg = BasicRegistry(PhysicalComponents);
     testing.refAllDecls(Reg);
 
-    var reg = Reg{};
+    var reg = try Reg.initCapacity(testing.allocator, 3);
     defer reg.deinit(testing.allocator);
 
     const entities: [2]Reg.Entity = entities: {

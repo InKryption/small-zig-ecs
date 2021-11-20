@@ -240,6 +240,35 @@ pub fn BasicRegistry(comptime Struct: type) type {
             return &slice.componentValues(component)[real_idx];
         }
 
+        pub fn write(self: Self, writer: anytype, entity: Entity) @TypeOf(writer).Error!void {
+            const slice = self.getSlice();
+            const real_idx = slice.realIndices()[@enumToInt(entity)];
+
+            const all_components = slice.allComponentSlices();
+
+            const component_name_array = comptime std.enums.values(ComponentName);
+            const component_count = component_count: {
+                var result: usize = 0;
+                inline for (component_name_array) |component_name| {
+                    result += @boolToInt(all_components.dataField(component_name).enabled_flags[real_idx]);
+                }
+                break :component_count result;
+            };
+
+            try writer.print("{}{{", .{entity});
+
+            var components_written: usize = 0;
+            inline for (component_name_array) |component_name| {
+                if (all_components.dataField(component_name).enabled_flags[real_idx]) {
+                    components_written += 1;
+                    try writer.print(" .{s} = {any}", .{ @tagName(component_name), all_components.dataField(component_name).values[real_idx] });
+                    if (components_written != component_count) try writer.writeByte(',');
+                    try writer.writeByte(' ');
+                }
+            }
+            try writer.writeAll("}");
+        }
+
         /// Invalidates pointers to components of 'entity1' and 'entity2'.
         /// Does no allocations and does nothing to the passed values themselves,
         /// only swaps memory values.
@@ -443,10 +472,14 @@ pub fn BasicRegistry(comptime Struct: type) type {
 
 test "BasicRegistry" {
     const PhysicalComponents = struct {
-        position: struct { x: f32, y: f32 },
-        velocity: struct { x: f32, y: f32 },
-        size: struct { w: f32, h: f32 },
-        mass: struct { value: f32 },
+        position: Vector,
+        velocity: Vector,
+        size: Size,
+        mass: Mass,
+
+        const Vector = struct { x: f32, y: f32 };
+        const Size = struct { w: f32, h: f32 };
+        const Mass = struct { value: f32 };
     };
 
     const Reg = BasicRegistry(PhysicalComponents);
@@ -462,6 +495,28 @@ test "BasicRegistry" {
     };
     defer reg.destroyMany(&entities);
 
+    const entity2 = try reg.create(testing.allocator);
+    defer reg.destroy(entity2);
+
     const entity3 = try reg.create(testing.allocator);
     defer reg.destroy(entity3);
+
+    reg.assign(entities[0], .position, .{ .x = 1, .y = 1 });
+    reg.assign(entities[1], .velocity, .{ .x = 2, .y = 2 });
+    reg.assign(entity2, .size, .{ .w = 4, .h = 4 });
+
+    reg.assign(entity3, .size, .{ .w = 8, .h = 8 });
+    reg.assign(entity3, .mass, .{ .value = 16 });
+
+    const stdout = std.io.getStdOut().writer();
+
+    try stdout.writeByte('\n');
+    try reg.write(stdout, entities[0]);
+    try stdout.writeByte('\n');
+    try reg.write(stdout, entities[1]);
+    try stdout.writeByte('\n');
+    try reg.write(stdout, entity2);
+    try stdout.writeByte('\n');
+    try reg.write(stdout, entity3);
+    try stdout.writeByte('\n');
 }

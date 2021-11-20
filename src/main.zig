@@ -144,20 +144,7 @@ pub fn BasicRegistry(comptime Struct: type) type {
         }
 
         pub fn assign(self: *Self, entity: Entity, comptime component: ComponentName, value: ComponentType(component)) void {
-            assert(self.entityIsValid(entity));
-            assert(!self.entityIsInGraveyard(entity));
-
-            const slice = self.getSlice();
-            const real_indices = slice.realIndices();
-            const alive_flags = slice.aliveFlags();
-            const components = slice.componentSlices(component);
-
-            const real_idx = real_indices[@enumToInt(entity)];
-            assert(alive_flags[real_idx]);
-            assert(!components.enabled_flags[real_idx]);
-
-            components.enabled_flags[real_idx] = true;
-            components.values[real_idx] = value;
+            self.assignMany(&.{entity}, component, value);
         }
 
         pub fn assignMany(self: *Self, entities: []const Entity, comptime component: ComponentName, value: ComponentType(component)) void {
@@ -180,21 +167,7 @@ pub fn BasicRegistry(comptime Struct: type) type {
         }
 
         pub fn remove(self: *Self, entity: Entity, comptime component: ComponentName) void {
-            assert(self.entityIsValid(entity));
-            assert(!self.entityIsInGraveyard(entity));
-
-            const slice = self.getSlice();
-            const real_indices = slice.realIndices();
-            const alive_flags = slice.aliveFlags();
-            const components = slice.componentSlices(component);
-
-            const real_idx = real_indices[@enumToInt(entity)];
-
-            assert(alive_flags[real_idx]);
-            assert(components.enabled_flags[real_idx]);
-
-            components.enabled_flags[real_idx] = false;
-            components.values[real_idx] = undefined;
+            self.removeMany(&.{entity}, component);
         }
 
         pub fn removeMany(self: *Self, entities: []const Entity, comptime component: ComponentName) void {

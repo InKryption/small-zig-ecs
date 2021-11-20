@@ -41,9 +41,8 @@ pub fn BasicRegistry(comptime Struct: type) type {
     if (!trait.is(.Struct)(Struct)) @compileError("Expected struct type.");
     return struct {
         const Self = @This();
-        _arena: heap.ArenaAllocator,
-        _store: EntityComponentsStore,
-        _graveyard: std.ArrayListUnmanaged(Entity),
+        _store: EntityComponentsStore = .{},
+        _graveyard: std.ArrayListUnmanaged(Entity) = .{},
 
         pub const Entity = enum(usize) { _ };
         pub const ComponentName = meta.FieldEnum(Struct);
@@ -51,22 +50,13 @@ pub fn BasicRegistry(comptime Struct: type) type {
             return meta.fieldInfo(Struct, name).field_type;
         }
 
-        pub fn init(child_allocator: *Allocator) Self {
-            return .{
-                ._arena = heap.ArenaAllocator.init(child_allocator),
-                ._store = .{},
-                ._graveyard = .{},
-            };
-        }
-
-        pub fn deinit(self: *Self) void {
-            self._arena.deinit();
+        pub fn deinit(self: *Self, allocator: *Allocator) void {
+            self._store.deinit(allocator);
+            self._graveyard.deinit(allocator);
             self.* = undefined;
         }
 
-        pub fn create(self: *Self) !Entity {
-            const allocator: *Allocator = &self._arena.allocator;
-
+        pub fn create(self: *Self, allocator: *Allocator) !Entity {
             if (self._graveyard.popOrNull()) |entity| {
                 const slice = self.getSlice();
                 const alive_flags = slice.aliveFlags();
@@ -92,13 +82,13 @@ pub fn BasicRegistry(comptime Struct: type) type {
             return new_id;
         }
 
-        pub fn createMany(self: *Self, buff: []Entity) !void {
-            const allocator: *Allocator = &self._arena.allocator;
-
+        pub fn createMany(self: *Self, allocator: *Allocator, buff: []Entity) !void {
             const resurrected_count = if (self._graveyard.items.len != 0) blk: {
                 const slice = self.getSlice();
                 const real_indices = slice.realIndices();
                 const alive_flags = slice.aliveFlags();
+
+                const all_components = slice.allComponentSlices();
 
                 const gy = &self._graveyard;
                 const resurrected_count = math.clamp(buff.len, 0, gy.items.len);
@@ -112,8 +102,8 @@ pub fn BasicRegistry(comptime Struct: type) type {
                     alive_flags[real_idx] = true;
 
                     inline for (comptime std.enums.values(ComponentName)) |component_name| {
-                        slice.componentEnabledFlags(component_name)[real_idx] = false;
-                        slice.componentValues(component_name)[real_idx] = undefined;
+                        all_components.dataField(component_name).enabled_flags[real_idx] = false;
+                        all_components.dataField(component_name).values[real_idx] = undefined;
                     }
 
                     buff[buff_idx] = entity;
@@ -176,7 +166,7 @@ pub fn BasicRegistry(comptime Struct: type) type {
             const slice = self.getSlice();
             const real_indices = slice.realIndices();
             const alive_flags = slice.aliveFlags();
-            const components = slice.componentArrays(component);
+            const components = slice.componentSlices(component);
 
             const real_idx = real_indices[@enumToInt(entity)];
             assert(alive_flags[real_idx]);
@@ -190,7 +180,7 @@ pub fn BasicRegistry(comptime Struct: type) type {
             const slice = self.getSlice();
             const real_indices = slice.realIndices();
             const alive_flags = slice.aliveFlags();
-            const components = slice.componentArrays(component);
+            const components = slice.componentSlices(component);
 
             for (entities) |entity| {
                 assert(self.entityIsValid(entity));
@@ -212,7 +202,7 @@ pub fn BasicRegistry(comptime Struct: type) type {
             const slice = self.getSlice();
             const real_indices = slice.realIndices();
             const alive_flags = slice.aliveFlags();
-            const components = slice.componentArrays(component);
+            const components = slice.componentSlices(component);
 
             const real_idx = real_indices[@enumToInt(entity)];
 
@@ -227,7 +217,7 @@ pub fn BasicRegistry(comptime Struct: type) type {
             const slice = self.getSlice();
             const real_indices = slice.realIndices();
             const alive_flags = slice.aliveFlags();
-            const components = slice.componentArrays(component);
+            const components = slice.componentSlices(component);
 
             for (entities) |entity| {
                 assert(self.entityIsValid(entity));
@@ -293,17 +283,21 @@ pub fn BasicRegistry(comptime Struct: type) type {
             return &slice.componentValues(component)[real_idx];
         }
 
-        /// Invalidates pointers to components
+        /// Invalidates pointers to components of 'entity1' and 'entity2'.
         /// Does no allocations and does nothing to the passed values themselves,
         /// only swaps memory values.
+        /// Given entities need not be alive; this memory will also be swapped.
         pub fn swapEntityPositions(self: *Self, entity1: Entity, entity2: Entity) void {
+            assert(self.entityIsValid(entity1));
+            assert(self.entityIsValid(entity2));
+
             const slice = self.getSlice();
 
-            const real_indexes = slice.realIndices();
-            defer mem.swap(usize, &real_indexes[@enumToInt(entity1)], &real_indexes[@enumToInt(entity2)]);
+            const real_indices = slice.realIndices();
+            defer mem.swap(usize, &real_indices[@enumToInt(entity1)], &real_indices[@enumToInt(entity2)]);
 
-            const entity1_old_idx = real_indexes[@enumToInt(entity1)];
-            const entity2_old_idx = real_indexes[@enumToInt(entity2)];
+            const entity1_old_idx = real_indices[@enumToInt(entity1)];
+            const entity2_old_idx = real_indices[@enumToInt(entity2)];
 
             inline for (comptime std.enums.values(ComponentName)) |component_name| {
                 const Value = ComponentType(component_name);
@@ -341,18 +335,19 @@ pub fn BasicRegistry(comptime Struct: type) type {
                 .is_tuple = false,
             };
 
-            const struct_fields = meta.fields(Struct);
+            for (std.enums.values(ComponentName)) |component_name| {
+                const T = meta.fieldInfo(Struct, component_name).field_type;
+                info.fields = info.fields ++ [_]TypeInfo.StructField{.{
+                    .name = @tagName(component_name) ++ "_value",
+                    .field_type = T,
+                    .default_value = @as(?T, null),
+                    .is_comptime = false,
+                    .alignment = @alignOf(T),
+                }};
+            }
 
-            for (struct_fields) |field_info| info.fields = info.fields ++ [_]TypeInfo.StructField{.{
-                .name = field_info.name ++ "_value",
-                .field_type = field_info.field_type,
-                .default_value = @as(?field_info.field_type, null),
-                .is_comptime = false,
-                .alignment = @alignOf(field_info.field_type),
-            }};
-
-            for (struct_fields) |field_info| info.fields = info.fields ++ [_]TypeInfo.StructField{.{
-                .name = field_info.name ++ "_enabled",
+            for (std.enums.values(ComponentName)) |component_name| info.fields = info.fields ++ [_]TypeInfo.StructField{.{
+                .name = @tagName(component_name) ++ "_enabled",
                 .field_type = bool,
                 .default_value = @as(?bool, false),
                 .is_comptime = false,
@@ -370,7 +365,7 @@ pub fn BasicRegistry(comptime Struct: type) type {
             info.fields = info.fields ++ [_]TypeInfo.StructField{.{
                 .name = "alive",
                 .field_type = bool,
-                .default_value = @as(?bool, true),
+                .default_value = @as(?bool, null),
                 .is_comptime = false,
                 .alignment = @alignOf(bool),
             }};
@@ -381,13 +376,50 @@ pub fn BasicRegistry(comptime Struct: type) type {
         const Slice = struct {
             _slice: EntityComponentsStore.Slice,
 
-            fn componentArrays(
-                self: Slice,
-                comptime component: ComponentName,
-            ) struct {
-                values: []ComponentType(component),
-                enabled_flags: []bool,
-            } {
+            const AllComponentSlices = struct {
+                data: Data,
+
+                fn dataField(self: AllComponentSlices, comptime component: ComponentName) ComponentSlices(component) {
+                    return @field(self.data, @tagName(component));
+                }
+
+                const Data = Data: {
+                    var info: TypeInfo.Struct = .{
+                        .layout = .Auto,
+                        .fields = &.{},
+                        .decls = &.{},
+                        .is_tuple = false,
+                    };
+                    for (std.enums.values(ComponentName)) |component_name| {
+                        const T = ComponentSlices(component_name);
+                        info.fields = info.fields ++ [_]TypeInfo.StructField{.{
+                            .name = @tagName(component_name),
+                            .field_type = T,
+                            .default_value = @as(?T, null),
+                            .is_comptime = false,
+                            .alignment = @alignOf(T),
+                        }};
+                    }
+                    break :Data @Type(@unionInit(TypeInfo, "Struct", info));
+                };
+            };
+
+            fn ComponentSlices(comptime component: ComponentName) type {
+                return struct {
+                    values: []ComponentType(component),
+                    enabled_flags: []bool,
+                };
+            }
+
+            fn allComponentSlices(self: Slice) AllComponentSlices {
+                var result: AllComponentSlices = undefined;
+                inline for (comptime std.enums.values(ComponentName)) |component_name| {
+                    @field(result.data, @tagName(component_name)) = self.componentSlices(component_name);
+                }
+                return result;
+            }
+
+            fn componentSlices(self: Slice, comptime component: ComponentName) ComponentSlices(component) {
                 return .{
                     .values = self.componentValues(component),
                     .enabled_flags = self.componentEnabledFlags(component),
@@ -461,14 +493,18 @@ test "BasicRegistry" {
     };
 
     const Reg = BasicRegistry(PhysicalComponents);
+    testing.refAllDecls(Reg);
 
-    var reg = Reg.init(testing.allocator);
-    defer reg.deinit();
+    var reg = Reg{};
+    defer reg.deinit(testing.allocator);
 
     const entities: [2]Reg.Entity = entities: {
         var entities_array: [2]Reg.Entity = undefined;
-        try reg.createMany(&entities_array);
+        try reg.createMany(testing.allocator, &entities_array);
         break :entities entities_array;
     };
     defer reg.destroyMany(&entities);
+
+    const entity3 = try reg.create(testing.allocator);
+    defer reg.destroy(entity3);
 }

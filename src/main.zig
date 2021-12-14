@@ -50,7 +50,7 @@ pub fn BasicRegistry(comptime Struct: type) type {
             return meta.fieldInfo(Struct, name).field_type;
         }
 
-        pub fn initCapacity(allocator: *Allocator, capacity: usize) !Self {
+        pub fn initCapacity(allocator: Allocator, capacity: usize) !Self {
             var _store = EntityComponentsStore{};
             errdefer _store.deinit(allocator);
             try _store.ensureTotalCapacity(allocator, capacity);
@@ -64,19 +64,19 @@ pub fn BasicRegistry(comptime Struct: type) type {
             };
         }
 
-        pub fn deinit(self: *Self, allocator: *Allocator) void {
+        pub fn deinit(self: *Self, allocator: Allocator) void {
             self._store.deinit(allocator);
             self._graveyard.deinit(allocator);
             self.* = undefined;
         }
 
-        pub fn create(self: *Self, allocator: *Allocator) !Entity {
+        pub fn create(self: *Self, allocator: Allocator) !Entity {
             var result = [1]Entity{undefined};
             try self.createMany(allocator, &result);
             return result[0];
         }
 
-        pub fn createMany(self: *Self, allocator: *Allocator, buff: []Entity) !void {
+        pub fn createMany(self: *Self, allocator: Allocator, buff: []Entity) !void {
             const resurrected_count = if (self._graveyard.items.len != 0) blk: {
                 const slice = self.getSlice();
                 const real_indices = slice.realIndices();

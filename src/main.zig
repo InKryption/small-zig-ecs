@@ -1,522 +1,541 @@
 const std = @import("std");
 const mem = std.mem;
-const heap = std.heap;
 const math = std.math;
 const meta = std.meta;
-const trait = meta.trait;
+const enums = std.enums;
 const debug = std.debug;
 const testing = std.testing;
 const builtin = std.builtin;
 
 const assert = debug.assert;
-const print = debug.print;
-
 const Allocator = mem.Allocator;
 const TypeInfo = builtin.TypeInfo;
 
-/// Struct with all the fields of `Struct`, but with all types as bool.
-pub fn FieldBools(comptime Struct: type, comptime options: struct {
-    layout: TypeInfo.ContainerLayout = .Auto,
-    default_value: ?bool = null,
-}) type {
-    var info: TypeInfo.Struct = .{
-        .layout = options.layout,
-        .fields = &.{},
-        .decls = &.{},
-        .is_tuple = false,
-    };
-
-    for (meta.fields(Struct)) |field_info| info.fields = info.fields ++ [_]TypeInfo.StructField{.{
-        .name = field_info.name,
-        .field_type = bool,
-        .default_value = options.default_value,
-        .is_comptime = false,
-        .alignment = @alignOf(bool),
-    }};
-
-    return @Type(@unionInit(TypeInfo, "Struct", info));
-}
-
-pub fn BasicRegistry(comptime Struct: type) type {
-    if (!trait.is(.Struct)(Struct)) @compileError("Expected struct type.");
+/// Basic Entity Registry, which stores entities an entity's component values/flags in a single allocation, in a table
+/// where component values/flags are stored sequentially in columns, next to a column of indexes which point to
+/// an arbitrary row in the component columns. The index column is indexed by entity ids, which then indicates which
+/// row is associated with an entity id, allowing for arbitrary ordering of data, whilst ensuring that an entity id
+/// is never invalidated, up until it is destroyed.
+pub fn BasicRegistry(comptime S: type) type {
+    if (@typeInfo(S) != .Struct) @compileError("Expected a Struct type.");
     return struct {
         const Self = @This();
-        _store: EntityComponentsStore = .{},
-        _graveyard: std.ArrayListUnmanaged(Entity) = .{},
+        _graveyard: usize = 0,
+        _store: meta_util.DataStore.Slice = .{
+            .ptrs = undefined,
+            .len = 0,
+            .capacity = 0,
+        },
 
-        pub const Entity = enum(usize) { _ };
-        pub const ComponentName = meta.FieldEnum(Struct);
-        pub fn ComponentType(comptime name: ComponentName) type {
-            return meta.fieldInfo(Struct, name).field_type;
-        }
+        pub const Struct = S;
+        pub const ComponentName = meta_util.ComponentName;
+        pub const Entity = enum(usize) {
+            const Tag = meta.Tag(@This());
+            _,
+        };
 
-        pub fn initCapacity(allocator: Allocator, capacity: usize) !Self {
-            var _store = EntityComponentsStore{};
-            errdefer _store.deinit(allocator);
-            try _store.ensureTotalCapacity(allocator, capacity);
-
-            var _graveyard = try std.ArrayListUnmanaged(Entity).initCapacity(allocator, capacity);
-            errdefer _graveyard.deinit(allocator);
-
-            return Self{
-                ._store = _store,
-                ._graveyard = _graveyard,
-            };
+        pub fn initCapacity(allocator: Allocator, num: usize) !Self {
+            var result = Self{};
+            errdefer result.deinit(allocator);
+            try result.ensureTotalCapacity(allocator, num);
+            return result;
         }
 
         pub fn deinit(self: *Self, allocator: Allocator) void {
             self._store.deinit(allocator);
-            self._graveyard.deinit(allocator);
-            self.* = undefined;
+            self.* = .{};
         }
 
-        pub fn create(self: *Self, allocator: Allocator) !Entity {
-            var result = [1]Entity{undefined};
-            try self.createMany(allocator, &result);
-            return result[0];
-        }
-
-        pub fn createMany(self: *Self, allocator: Allocator, buff: []Entity) !void {
-            const resurrected_count = if (self._graveyard.items.len != 0) blk: {
-                const slice = self.getSlice();
-                const real_indices = slice.realIndices();
-                const alive_flags = slice.aliveFlags();
-
-                const all_components = slice.allComponentSlices();
-
-                const gy = &self._graveyard;
-                const resurrected_count = math.clamp(buff.len, 0, gy.items.len);
-                for (gy.items[gy.items.len - resurrected_count ..]) |entity, buff_idx| {
-                    assert(self.entityIsValid(entity));
-                    // assert(self.entityIsInGraveyard(entity)); // this is a given since the program is currently iterating over _graveyard's items
-
-                    const real_idx = real_indices[@enumToInt(entity)];
-
-                    assert(!alive_flags[real_idx]);
-                    alive_flags[real_idx] = true;
-
-                    inline for (comptime std.enums.values(ComponentName)) |component_name| {
-                        all_components.dataField(component_name).enabled_flags[real_idx] = false;
-                        all_components.dataField(component_name).values[real_idx] = undefined;
-                    }
-
-                    buff[buff_idx] = entity;
-                }
-
-                self._graveyard.resize(allocator, gy.items.len - resurrected_count) catch unreachable;
-                if (resurrected_count == buff.len) return;
-
-                break :blk resurrected_count;
-            } else 0;
-
-            const remaining_buff = buff[resurrected_count..];
-
-            try self._graveyard.ensureTotalCapacity(allocator, self._store.len + remaining_buff.len);
-            try self._store.ensureUnusedCapacity(allocator, remaining_buff.len);
-
-            for (remaining_buff) |*buff_item| {
-                const new_id = @intToEnum(Entity, self._store.len);
-                self._store.appendAssumeCapacity(entityDataStructFrom(@enumToInt(new_id), true, undefined, .{}));
-                buff_item.* = new_id;
-            }
+        pub fn create(self: *Self, allocator: *Allocator) Allocator.Error!Entity {
+            var one_entity: [1]Entity = undefined;
+            self.createMany(allocator, &one_entity);
+            return one_entity[0];
         }
 
         pub fn destroy(self: *Self, entity: Entity) void {
-            self.destroyMany(&.{entity});
+            self.destroyMany(&[_]Entity{ entity });
+        }
+
+        pub fn createAssumeCapacity(self: *Self) Entity {
+            var one_entity: [1]Entity = undefined;
+            self.createManyAssumeCapacity(&one_entity);
+            return one_entity[0];
+        }
+
+        pub fn createMany(self: *Self, allocator: Allocator, entities: []Entity) Allocator.Error!void {
+            try self.ensureUnusedCapacity(allocator, entities.len);
+            self.createManyAssumeCapacity(entities);
+        }
+
+        pub fn createManyAssumeCapacity(self: *Self, entities: []Entity) void {
+            const resurrected_entity_count = math.clamp(self._graveyard, 0, entities.len);
+
+            assert((entities.len - resurrected_entity_count) <= (self._store.capacity - self._store.len));
+            var store_as_multi_array_list = self._store.toMultiArrayList();
+            defer self._store = store_as_multi_array_list.toOwnedSlice();
+
+            if (resurrected_entity_count != 0) {
+                var i: usize = 0;
+                while (i < resurrected_entity_count) : (i += 1) {
+                    self._graveyard -= 1;
+                    entities[i] = @intToEnum(Entity, self._graveyard);
+                }
+            }
+
+            const remaining_uninitialized = entities[resurrected_entity_count..];
+            for (remaining_uninitialized) |*ent| {
+                const entity_int_value = self._store.len;
+                ent.* = @intToEnum(Entity, entity_int_value);
+                store_as_multi_array_list.appendAssumeCapacity(meta_util.makeDefaultEntityDataStruct(entity_int_value));
+            }
         }
 
         pub fn destroyMany(self: *Self, entities: []const Entity) void {
-            assert(entities.len <= self._store.len);
-            const slice = self.getSlice();
-            const real_indices = slice.realIndices();
-            const alive_flags = slice.aliveFlags();
-
-            for (entities) |entity| {
-                assert(self.entityIsValid(entity));
-                assert(!self.entityIsInGraveyard(entity));
-
-                const real_idx = real_indices[@enumToInt(entity)];
-                assert(alive_flags[real_idx]);
-                alive_flags[real_idx] = false;
-            }
-
-            self._graveyard.appendSliceAssumeCapacity(entities);
-        }
-
-        pub fn assign(self: *Self, entity: Entity, comptime component: ComponentName, value: ComponentType(component)) void {
-            self.assignMany(&.{entity}, component, value);
-        }
-
-        pub fn assignMany(self: *Self, entities: []const Entity, comptime component: ComponentName, value: ComponentType(component)) void {
-            const slice = self.getSlice();
-            const real_indices = slice.realIndices();
-            const alive_flags = slice.aliveFlags();
-            const components = slice.componentSlices(component);
-
-            for (entities) |entity| {
-                assert(self.entityIsValid(entity));
-                assert(!self.entityIsInGraveyard(entity));
-
-                const real_idx = real_indices[@enumToInt(entity)];
-                assert(alive_flags[real_idx]);
-                assert(!components.enabled_flags[real_idx]);
-
-                components.enabled_flags[real_idx] = true;
-                components.values[real_idx] = value;
+            for (entities) |ent| {
+                assert(self.entityIsAlive(ent));
+                self.swapEntityPositions(ent, @intToEnum(Entity, self._graveyard));
+                self._graveyard += 1;
+                inline for (comptime enums.values(ComponentName)) |name| {
+                    if (self.has(ent, name)) _ = self.remove(ent, name);
+                }
             }
         }
 
-        pub fn remove(self: *Self, entity: Entity, comptime component: ComponentName) void {
-            self.removeMany(&.{entity}, component);
+        pub fn ensureTotalCapacity(self: *Self, allocator: Allocator, num: usize) Allocator.Error!void {
+            var store_as_multi_array_list = self._store.toMultiArrayList();
+            defer self._store = store_as_multi_array_list.toOwnedSlice();
+            try store_as_multi_array_list.ensureTotalCapacity(allocator, num);
         }
 
-        pub fn removeMany(self: *Self, entities: []const Entity, comptime component: ComponentName) void {
-            const slice = self.getSlice();
-            const real_indices = slice.realIndices();
-            const alive_flags = slice.aliveFlags();
-            const components = slice.componentSlices(component);
-
-            for (entities) |entity| {
-                assert(self.entityIsValid(entity));
-                assert(!self.entityIsInGraveyard(entity));
-
-                const real_idx = real_indices[@enumToInt(entity)];
-
-                assert(alive_flags[real_idx]);
-                assert(components.enabled_flags[real_idx]);
-
-                components.enabled_flags[real_idx] = false;
-                components.values[real_idx] = undefined;
-            }
-        }
-
-        pub fn has(self: Self, entity: Entity, comptime component: ComponentName) bool {
-            const slice = self.getSlice();
-            const real_idx = slice.realIndices()[@enumToInt(entity)];
-            return slice.componentEnabledFlags(component)[real_idx];
+        pub fn ensureUnusedCapacity(self: *Self, allocator: Allocator, num: usize) Allocator.Error!void {
+            var store_as_multi_array_list = self._store.toMultiArrayList();
+            defer self._store = store_as_multi_array_list.toOwnedSlice();
+            try store_as_multi_array_list.ensureUnusedCapacity(allocator, math.max(num, self.unusedCapacity()));
         }
 
         pub fn get(self: Self, entity: Entity, comptime component: ComponentName) ?ComponentType(component) {
-            assert(self.entityIsValid(entity));
-            assert(!self.entityIsInGraveyard(entity));
-
-            const slice = self.getSlice();
-            const real_idx = slice.realIndices()[@enumToInt(entity)];
-
-            if (!slice.componentEnabledFlags(component)[real_idx]) return null;
-            return slice.componentValues(component)[real_idx];
+            assert(self.entityIsAlive(entity));
+            const index = self.getEntityComponentsIndex(entity);
+            if (!self.has(entity, component)) return null;
+            return self.getSliceOfComponentValues(component)[index];
         }
 
         pub fn getPtr(self: *Self, entity: Entity, comptime component: ComponentName) ?*ComponentType(component) {
-            assert(self.entityIsValid(entity));
-            assert(!self.entityIsInGraveyard(entity));
-
-            const slice = self.getSlice();
-            const real_idx = slice.realIndices()[@enumToInt(entity)];
-
-            if (!slice.componentEnabledFlags(component)[real_idx]) return null;
-            return &slice.componentValues(component)[real_idx];
+            assert(self.entityIsAlive(entity));
+            const index = self.getEntityComponentsIndex(entity);
+            if (!self.has(entity, component)) return null;
+            return &self.getSliceOfComponentValues(component)[index];
         }
 
-        pub fn getAssume(self: Self, entity: Entity, comptime component: ComponentName) ComponentType(component) {
-            assert(self.entityIsValid(entity));
-            assert(!self.entityIsInGraveyard(entity));
-
-            const slice = self.getSlice();
-            const real_idx = slice.realIndices()[@enumToInt(entity)];
-
-            assert(slice.componentEnabledFlags(component)[real_idx]);
-            return slice.componentValues(component)[real_idx];
+        pub fn has(self: Self, entity: Entity, comptime component: ComponentName) bool {
+            assert(self.entityIsAlive(entity));
+            const index = self.getEntityComponentsIndex(entity);
+            return self.getSliceOfComponentFlags(component)[index];
         }
 
-        pub fn getPtrAssume(self: *Self, entity: Entity, comptime component: ComponentName) *ComponentType(component) {
-            assert(self.entityIsValid(entity));
-            assert(!self.entityIsInGraveyard(entity));
+        pub const ComponentFlags = meta_util.ComponentFlags;
 
-            const slice = self.getSlice();
-            const real_idx = slice.realIndices()[@enumToInt(entity)];
-
-            assert(slice.componentEnabledFlags(component)[real_idx]);
-            return &slice.componentValues(component)[real_idx];
-        }
-
-        pub fn write(self: Self, writer: anytype, entity: Entity) @TypeOf(writer).Error!void {
-            const slice = self.getSlice();
-            const real_idx = slice.realIndices()[@enumToInt(entity)];
-
-            const all_components = slice.allComponentSlices();
-
-            const component_name_array = comptime std.enums.values(ComponentName);
-            const component_count = component_count: {
-                var result: usize = 0;
-                inline for (component_name_array) |component_name| {
-                    result += @boolToInt(all_components.dataField(component_name).enabled_flags[real_idx]);
-                }
-                break :component_count result;
-            };
-
-            try writer.print("{}{{", .{entity});
-
-            var components_written: usize = 0;
-            inline for (component_name_array) |component_name| {
-                if (all_components.dataField(component_name).enabled_flags[real_idx]) {
-                    components_written += 1;
-                    try writer.print(" .{s} = {any}", .{ @tagName(component_name), all_components.dataField(component_name).values[real_idx] });
-                    if (components_written != component_count) try writer.writeByte(',');
-                    try writer.writeByte(' ');
+        pub fn hasAny(self: Self, entity: Entity, comptime components: ComponentFlags) bool {
+            assert(self.entityIsAlive(entity));
+            const index = self.getEntityComponentsIndex(entity);
+            inline for (comptime enums.values(ComponentName)) |name| {
+                if (@field(components, @tagName(name))) {
+                    const flags = self.getSliceOfComponentFlags(name);
+                    if (flags[index]) return true;
                 }
             }
-            try writer.writeAll("}");
+            return false;
         }
 
-        /// Invalidates pointers to components of 'entity1' and 'entity2'.
-        /// Does no allocations and does nothing to the passed values themselves,
-        /// only swaps memory values.
-        /// Given entities need not be alive; this memory will also be swapped.
-        pub fn swapEntityPositions(self: *Self, entity1: Entity, entity2: Entity) void {
-            assert(self.entityIsValid(entity1));
-            assert(self.entityIsValid(entity2));
-
-            const slice = self.getSlice();
-
-            const real_indices = slice.realIndices();
-            defer mem.swap(usize, &real_indices[@enumToInt(entity1)], &real_indices[@enumToInt(entity2)]);
-
-            const entity1_old_idx = real_indices[@enumToInt(entity1)];
-            const entity2_old_idx = real_indices[@enumToInt(entity2)];
-
-            inline for (comptime std.enums.values(ComponentName)) |component_name| {
-                const Value = ComponentType(component_name);
-
-                const component_values: []Value = slice.componentValues(component_name);
-                mem.swap(Value, &component_values[entity1_old_idx], &component_values[entity2_old_idx]);
-
-                const component_flags: []bool = slice.componentEnabledFlags(component_name);
-                mem.swap(bool, &component_flags[entity1_old_idx], &component_flags[entity2_old_idx]);
+        pub fn hasAll(self: Self, entity: Entity, comptime components: ComponentFlags) bool {
+            assert(self.entityIsAlive(entity));
+            const index = self.getEntityComponentsIndex(entity);
+            inline for (comptime enums.values(ComponentName)) |name| {
+                const flags = self.getSliceOfComponentFlags(name);
+                if (@field(components, @tagName(name))) {
+                    if (!flags[index]) return false;
+                }
             }
-
-            const alive_flags = slice.aliveFlags();
-            mem.swap(bool, &alive_flags[entity1_old_idx], &alive_flags[entity2_old_idx]);
+            return true;
         }
 
-        fn entityIsValid(self: Self, entity: Entity) bool {
-            return @enumToInt(entity) < self._store.len;
+        pub fn assign(self: *Self, entity: Entity, comptime component: ComponentName) *ComponentType(component) {
+            assert(self.entityIsAlive(entity));
+            const index = self.getEntityComponentsIndex(entity);
+            const flags = self.getSliceOfComponentFlags(component);
+
+            assert(!flags[index]);
+            flags[index] = true;
+            const ptr = self.getPtr(entity, component).?;
+            ptr.* = undefined;
+            return ptr;
         }
 
-        fn entityIsInGraveyard(self: Self, entity: Entity) bool {
-            assert(self.entityIsValid(entity));
-            const first_idx = mem.indexOfScalar(Entity, self._graveyard.items, entity);
-            const last_idx = mem.lastIndexOfScalar(Entity, self._graveyard.items, entity);
+        pub fn remove(self: *Self, entity: Entity, comptime component: ComponentName) ComponentType(component) {
+            assert(self.entityIsAlive(entity));
+            const index = self.getEntityComponentsIndex(entity);
+            const flags = self.getSliceOfComponentFlags(component);
+            
+            assert(flags[index]);
+            const ptr = self.getPtr(entity, component).?;
+            const val = ptr.*;
+            ptr.* = undefined;
+            flags[index] = false;
 
-            assert(meta.eql(first_idx, last_idx));
-            return first_idx != null;
+            return val;
         }
 
-        const EntityComponentsStore = std.MultiArrayList(EntityDataStruct);
-        const EntityDataStruct = EntityDataStruct: {
-            var info: TypeInfo.Struct = .{
-                .layout = .Auto,
-                .fields = &.{},
-                .decls = &.{},
-                .is_tuple = false,
+        pub fn entityCount(self: Self) usize {
+            return self._store.len - self._graveyard;
+        }
+
+        pub fn capacity(self: Self) usize {
+            return self._store.capacity;
+        }
+
+        pub fn unusedCapacity(self: Self) usize {
+            return (self.capacity() - self.entityCount()) + self._graveyard;
+        }
+
+        pub const WriteEntityOptions = struct {
+            /// If non-null, prints a period or the value of the entity id before
+            /// the structure brackets.
+            prefix: ?Prefix = .period,
+            /// If true, components not possessed by the entity
+            /// will be written with a value equal to null.
+            null_components: bool = false,
+            /// If non-null, newlines are inserted between each field,
+            /// and before and after the first and last fields, respectively,
+            /// alongside indentation based on specified depth, and in the case
+            /// of spaces, number of spaces per indent.
+            newline_indentation: ?NewlineIndentation = null,
+            /// Used for newline-based indentation
+            eol: Eol = .lf,
+            /// For each component, if the specified will be used as the
+            /// format specifier for the value of the component.
+            component_formats: ComponentFormats = .{},
+
+            pub const Prefix = enum { entity_id, period };
+            pub const NewlineIndentation = union(enum) {
+                tabs: u4,
+                spaces: struct {
+                    depth: u4,
+                    count: u4 = 4,
+                },
+            };
+            pub const Eol = enum { lf, crlf };
+            pub const ComponentFormats = enums.EnumFieldStruct(ComponentName, []const u8, "any");
+        };
+        pub fn writeEntity(
+            self: Self,
+            entity: Entity,
+            writer: anytype,
+            comptime options: WriteEntityOptions,
+        ) @TypeOf(writer).Error!void {
+            const component_names = comptime enums.values(ComponentName);
+            const eol: []const u8 = comptime switch (options.eol) { .lf => "\n", .crlf => "\n\r" };
+            const indentation_char_stride = if (options.newline_indentation) |nli| switch (nli) {
+                .tabs => 1,
+                .spaces => |spaces| spaces.count,
+            };
+            const indentation: []const u8 = if (options.newline_indentation) |nli| switch (nli) {
+                .tabs => |tabs|  &([_]u8{ '\t' } ** (tabs + 1)),
+                .spaces => |spaces| &(([_]u8{ ' ' } ** spaces.count) ** (spaces.depth + 1)),
+            } else "";
+
+            if (indentation.len != 0) try writer.writeAll(indentation[indentation_char_stride..]);
+
+            if (comptime options.prefix) |prefix| switch (prefix) {
+                .entity_id => try writer.print("{}", .{ entity }),
+                .period => try writer.writeByte('.'),
             };
 
-            for (std.enums.values(ComponentName)) |component_name| {
-                const T = meta.fieldInfo(Struct, component_name).field_type;
-                info.fields = info.fields ++ [_]TypeInfo.StructField{.{
-                    .name = @tagName(component_name) ++ "_value",
-                    .field_type = T,
-                    .default_value = @as(?T, null),
+            try writer.writeByte('{');
+
+            if (enums.values(ComponentName).len == 0 or is_empty: {
+                comptime var component_flags: ComponentFlags = .{};
+                inline for (component_names) |name| @field(component_flags, @tagName(name)) = true;
+                break :is_empty !self.hasAny(entity, component_flags);
+            }) return try writer.writeByte('}');
+
+            if (options.newline_indentation != null) try writer.writeAll(eol);
+
+            inline for (component_names) |name| {
+                const after_field: []const u8 = if (indentation.len != 0) eol else "";
+                const space_or_indentation = if (indentation.len == 0) " " else indentation;
+                const format_spec = @field(options.component_formats, @tagName(name));
+                if (self.get(entity, name)) |val| {
+                    try writer.print(space_or_indentation ++ ".{s} = {" ++ format_spec ++ "}," ++ after_field, .{ @tagName(name), val });
+                } else if (options.null_components) {
+                    try writer.print(space_or_indentation ++ ".{s} = null," ++ after_field, .{ @tagName(name) });
+                }
+            }
+
+            if (indentation.len != 0) {
+                try writer.writeAll(indentation[indentation_char_stride..] ++ "}");
+            } else {
+                try writer.writeAll(" }");
+            }
+        }
+
+        pub const EntityViewSortType = union(enum) {
+            require_one: ComponentName,
+            require_any: ComponentFlags,
+            require_all: ComponentFlags,
+        };
+
+        /// Sorts entities for the desired components, and
+        /// overwrites the provided array list with said entities.
+        /// Returns the slice of the array list of 
+        pub fn entityViewArrayList(
+            self: Self,
+            array_list: *std.ArrayList(Entity),
+            comptime entity_view_sort_type: EntityViewSortType,
+        ) ![]const Entity {
+            array_list.resize(0) catch unreachable;
+            try array_list.ensureTotalCapacity(self._store.len);
+
+            const indices: []const usize = self.getSliceOfIndices();
+
+            switch (entity_view_sort_type) {
+                .require_one => |info| {
+                    const flags: []const bool = self.getSliceOfComponentFlags(info);
+                    var entity = self.firstEntity();
+                    while (entity != self.sentinelEntity()) : (entity = @intToEnum(Entity, @enumToInt(entity) + 1)) {
+                        const index = indices[@enumToInt(entity)];
+                        if (flags[index]) array_list.appendAssumeCapacity(entity);
+                    }
+                },
+                .require_any => |info| {
+                    var entity = self.firstEntity();
+                    while (entity != self.sentinelEntity()) : (entity = @intToEnum(Entity, @enumToInt(entity) + 1)) {
+                        if (self.hasAny(entity, info)) array_list.appendAssumeCapacity(entity);
+                    }
+                },
+                .require_all => |info| {
+                    var entity = self.firstEntity();
+                    while (entity != self.sentinelEntity()) : (entity = @intToEnum(Entity, @enumToInt(entity) + 1)) {
+                        if (self.hasAll(entity, info)) array_list.appendAssumeCapacity(entity);
+                    }
+                },
+            }
+
+            return array_list.items[0..];
+        }
+
+        /// Returns id of first entity not in the graveyard section.
+        fn firstEntity(self: Self) Entity {
+            return @intToEnum(Entity, self._graveyard);
+        }
+
+        /// Returns id of last living entity.
+        fn lastEntity(self: Self) Entity {
+            return @intToEnum(Entity, self._store.len - 1);
+        }
+
+        /// Returns sentinel entity id, which is not associated
+        /// with an actual entity, but can be used to indicate
+        /// the end of an iteration internally.
+        fn sentinelEntity(self: Self) Entity {
+            return @intToEnum(Entity, @enumToInt(self.lastEntity()) + 1);
+        }
+
+        /// Swaps the indexes, and subsequently the values
+        /// in each component row referred to by each index,
+        /// of the given entities. This has no outwardly visible effect,
+        /// except that it invalidates any pointers to the components of
+        /// the given entities.
+        /// Self doesn't need to be mutable here,
+        /// but it's better to mark it as such, to indicate that
+        /// mutation does indeed occur.
+        fn swapEntityPositions(self: *Self, a: Entity, b: Entity) void {
+            assert(self.entityIsValid(a));
+            assert(self.entityIsValid(b));
+
+            const indexes = self.getSliceOfIndices();
+            mem.swap(usize, &indexes[@enumToInt(a)], &indexes[@enumToInt(b)]);
+
+            const index_a = indexes[@enumToInt(a)];
+            const index_b = indexes[@enumToInt(b)];
+            inline for (comptime enums.values(ComponentName)) |name| {
+                const flags = self.getSliceOfComponentFlags(name);
+                mem.swap(bool, &flags[index_a], &flags[index_b]);
+
+                const values = self.getSliceOfComponentValues(name);
+                mem.swap(ComponentType(name), &values[index_a], &values[index_b]);
+            }
+        }
+
+        inline fn getEntityComponentsIndex(self: Self, entity: Entity) usize {
+            assert(self.entityIsValid(entity));
+            return self.getSliceOfIndices()[@enumToInt(entity)];
+        }
+
+        inline fn entityIsAlive(self: Self, entity: Entity) bool {
+            return self.entityIsValid(entity) and @enumToInt(entity) >= @enumToInt(self.firstEntity());
+        }
+
+        inline fn entityIsValid(self: Self, entity: Entity) bool {
+            return @enumToInt(entity) < @enumToInt(self.sentinelEntity());
+        }
+
+        fn getSliceOfComponentValues(self: Self, comptime component: ComponentName) []ComponentType(component) {
+            const field_name = comptime meta_util.componentNameToFieldName(.value, component);
+            return self._store.items(field_name);
+        }
+
+        fn getSliceOfComponentFlags(self: Self, comptime component: ComponentName) []bool {
+            const field_name = comptime meta_util.componentNameToFieldName(.flag, component);
+            return self._store.items(field_name);
+        }
+
+        fn getSliceOfIndices(self: Self) []usize {
+            return self._store.items(.index);
+        }
+
+        const ComponentType = meta_util.ComponentType;
+        const meta_util = BasicRegistryMetaUtil(S);
+    };
+}
+
+fn BasicRegistryMetaUtil(comptime S: type) type {
+    return struct {
+        const DataStore = std.MultiArrayList(EntityDataStruct);
+
+        /// A struct generated based off of the given input struct,
+        /// and which is meant to be used as an argument to `std.MultiArrayList`.
+        /// It contains two fields per field of the input struct, each
+        /// pair of which possess the name of the respective field,
+        /// prefixed "value_" and "flag_" respectively;
+        /// after that, it contains a field called `index`,
+        /// which is to be used as the index to get the row
+        /// of components belonging to the Entity used to
+        /// access the index in the `std.MultiArrayList`.
+        const EntityDataStruct: type = EntityDataStruct: {
+            var fields: [(meta.fields(S).len * 2) + 1]TypeInfo.StructField = undefined;
+            for (meta.fields(S)) |field_info, i| {
+                fields[i] = TypeInfo.StructField{
+                    .name = (value_field_prefix ++ field_info.name),
+                    .field_type = field_info.field_type,
+                    .default_value = @as(?field_info.field_type, null),
                     .is_comptime = false,
-                    .alignment = @alignOf(T),
-                }};
+                    .alignment = field_info.alignment,
+                };
+                fields[i + meta.fields(S).len] = TypeInfo.StructField{
+                    .name = flag_field_prefix ++ field_info.name,
+                    .field_type = bool,
+                    .default_value = @as(?bool, null),
+                    .is_comptime = false,
+                    .alignment = @alignOf(bool),
+                };
             }
-
-            for (std.enums.values(ComponentName)) |component_name| info.fields = info.fields ++ [_]TypeInfo.StructField{.{
-                .name = @tagName(component_name) ++ "_enabled",
-                .field_type = bool,
-                .default_value = @as(?bool, false),
-                .is_comptime = false,
-                .alignment = @alignOf(bool),
-            }};
-
-            info.fields = info.fields ++ [_]TypeInfo.StructField{.{
-                .name = "real_index",
+            fields[fields.len - 1] = TypeInfo.StructField{
+                .name = "index",
                 .field_type = usize,
                 .default_value = @as(?usize, null),
                 .is_comptime = false,
                 .alignment = @alignOf(usize),
-            }};
-
-            info.fields = info.fields ++ [_]TypeInfo.StructField{.{
-                .name = "alive",
-                .field_type = bool,
-                .default_value = @as(?bool, null),
-                .is_comptime = false,
-                .alignment = @alignOf(bool),
-            }};
-
-            break :EntityDataStruct @Type(@unionInit(TypeInfo, "Struct", info));
+            };
+            break :EntityDataStruct @Type(@unionInit(TypeInfo, "Struct", TypeInfo.Struct{
+                .layout = TypeInfo.ContainerLayout.Auto,
+                .fields = @as([]const TypeInfo.StructField, &fields),
+                .decls = &[_]TypeInfo.Declaration{},
+                .is_tuple = false,
+            }));
         };
 
-        const Slice = struct {
-            _slice: EntityComponentsStore.Slice,
-
-            const AllComponentSlices = struct {
-                data: Data,
-
-                fn dataField(self: AllComponentSlices, comptime component: ComponentName) ComponentSlices(component) {
-                    return @field(self.data, @tagName(component));
-                }
-
-                const Data = Data: {
-                    var info: TypeInfo.Struct = .{
-                        .layout = .Auto,
-                        .fields = &.{},
-                        .decls = &.{},
-                        .is_tuple = false,
-                    };
-                    for (std.enums.values(ComponentName)) |component_name| {
-                        const T = ComponentSlices(component_name);
-                        info.fields = info.fields ++ [_]TypeInfo.StructField{.{
-                            .name = @tagName(component_name),
-                            .field_type = T,
-                            .default_value = @as(?T, null),
-                            .is_comptime = false,
-                            .alignment = @alignOf(T),
-                        }};
-                    }
-                    break :Data @Type(@unionInit(TypeInfo, "Struct", info));
-                };
-            };
-
-            fn ComponentSlices(comptime component: ComponentName) type {
-                return struct {
-                    values: []ComponentType(component),
-                    enabled_flags: []bool,
-                };
-            }
-
-            fn allComponentSlices(self: Slice) AllComponentSlices {
-                var result: AllComponentSlices = undefined;
-                inline for (comptime std.enums.values(ComponentName)) |component_name| {
-                    @field(result.data, @tagName(component_name)) = self.componentSlices(component_name);
-                }
-                return result;
-            }
-
-            fn componentSlices(self: Slice, comptime component: ComponentName) ComponentSlices(component) {
-                return .{
-                    .values = self.componentValues(component),
-                    .enabled_flags = self.componentEnabledFlags(component),
-                };
-            }
-
-            fn componentValues(self: Slice, comptime component: ComponentName) []ComponentType(component) {
-                return self._slice.items(comptime asComponentValueFieldName(component));
-            }
-
-            fn componentEnabledFlags(self: Slice, comptime component: ComponentName) []bool {
-                return self._slice.items(comptime asComponentEnabledFieldName(component));
-            }
-
-            fn realIndices(self: Slice) []usize {
-                return self._slice.items(.real_index);
-            }
-
-            fn aliveFlags(self: Slice) []bool {
-                return self._slice.items(.alive);
-            }
-        };
-
-        fn getSlice(self: Self) Slice {
-            return .{
-                ._slice = self._store.slice(),
-            };
-        }
-
-        fn entityDataStructFrom(
-            real_index: usize,
-            alive: bool,
-            components: Struct,
-            flags: FieldBools(Struct, .{ .layout = .Packed, .default_value = false }),
-        ) EntityDataStruct {
+        /// Returns an instance of `EntityDataStruct` with its index field
+        /// set to the specified value, all flag fields set to false,
+        /// and all value fields set to undefined.
+        fn makeDefaultEntityDataStruct(index: usize) EntityDataStruct {
             var result: EntityDataStruct = undefined;
-
-            result.real_index = real_index;
-            result.alive = alive;
-
-            inline for (comptime std.enums.values(ComponentName)) |component_name| {
-                const component_enabled = @field(flags, @tagName(component_name));
-                const component_value = @field(components, @tagName(component_name));
-
-                const component_enabled_field_name = comptime @tagName(asComponentEnabledFieldName(component_name));
-                const component_value_field_name = comptime @tagName(asComponentValueFieldName(component_name));
-
-                @field(result, component_enabled_field_name) = component_enabled;
-                @field(result, component_value_field_name) = component_value;
+            result.index = index;
+            inline for (comptime enums.values(ComponentName)) |name| {
+                const field_name = comptime componentNameToFieldName(.flag, name);
+                @field(result, @tagName(field_name)) = false;
             }
-
             return result;
         }
 
-        fn asComponentValueFieldName(comptime name: ComponentName) EntityComponentsStore.Field {
-            return @field(EntityComponentsStore.Field, @tagName(name) ++ "_value");
+        const GeneratedFieldType = enum {
+            value,
+            flag,
+            fn prefix(self: GeneratedFieldType) [:0]const u8 {
+                return switch (self) {
+                    .value => "value_",
+                    .flag => "flag_",
+                };
+            }
+        };
+
+        const value_field_prefix = GeneratedFieldType.prefix(.value);
+        const flag_field_prefix = GeneratedFieldType.prefix(.flag);
+
+        const ComponentName = meta.FieldEnum(S);
+        const FieldName = meta.FieldEnum(EntityDataStruct);
+
+        const ComponentFlags = enums.EnumFieldStruct(ComponentName, bool, false);
+
+        fn ComponentType(comptime name: ComponentName) type {
+            return meta.fieldInfo(S, name).field_type;
         }
 
-        fn asComponentEnabledFieldName(comptime name: ComponentName) EntityComponentsStore.Field {
-            return @field(EntityComponentsStore.Field, @tagName(name) ++ "_enabled");
+        inline fn componentNameToFieldName(
+            comptime generated_field_type: GeneratedFieldType,
+            comptime component_name: ComponentName,
+        ) FieldName {
+            const name_str = generated_field_type.prefix() ++ @tagName(component_name);
+            return @field(FieldName, name_str);
         }
+
+        
     };
 }
 
 test "BasicRegistry" {
-    const PhysicalComponents = struct {
-        position: Vector,
-        velocity: Vector,
-        size: Size,
-        mass: Mass,
+    const Reg = BasicRegistry(struct {
+        position: Position,
+        velocity: Velocity,
 
-        const Vector = struct { x: f32, y: f32 };
-        const Size = struct { w: f32, h: f32 };
-        const Mass = struct { value: f32 };
-    };
+        const Position = struct { x: f32, y: f32 };
+        const Velocity = struct { x: f32, y: f32 };
+    });
 
-    const Reg = BasicRegistry(PhysicalComponents);
-    testing.refAllDecls(Reg);
-
-    var reg = try Reg.initCapacity(testing.allocator, 3);
+    var reg = try Reg.initCapacity(testing.allocator, 8);
     defer reg.deinit(testing.allocator);
 
-    const entities: [2]Reg.Entity = entities: {
-        var entities_array: [2]Reg.Entity = undefined;
-        try reg.createMany(testing.allocator, &entities_array);
-        break :entities entities_array;
-    };
-    defer reg.destroyMany(&entities);
+    const ent0 = reg.createAssumeCapacity();
+    const ent1 = reg.createAssumeCapacity();
 
-    const entity2 = try reg.create(testing.allocator);
-    defer reg.destroy(entity2);
+    try testing.expect(!reg.has(ent0, .position));
+    try testing.expect(!reg.has(ent0, .velocity));
 
-    const entity3 = try reg.create(testing.allocator);
-    defer reg.destroy(entity3);
+    try testing.expect(!reg.has(ent1, .position));
+    try testing.expect(!reg.has(ent1, .velocity));
 
-    reg.assign(entities[0], .position, .{ .x = 1, .y = 1 });
-    reg.assign(entities[1], .velocity, .{ .x = 2, .y = 2 });
-    reg.assign(entity2, .size, .{ .w = 4, .h = 4 });
+    reg.assign(ent0, .position).* = Reg.Struct.Position{ .x = 0.2, .y = 0.3 };
+    reg.assign(ent1, .velocity).* = Reg.Struct.Velocity{ .x = 122.0, .y = 10.4 };
 
-    reg.assign(entity3, .size, .{ .w = 8, .h = 8 });
-    reg.assign(entity3, .mass, .{ .value = 16 });
+    try testing.expect(reg.has(ent0, .position));
+    try testing.expectEqual(reg.get(ent0, .position).?.x, 0.2);
+    try testing.expectEqual(reg.get(ent0, .position).?.y, 0.3);
+
+    try testing.expect(reg.has(ent1, .velocity));
+    try testing.expectEqual(reg.get(ent1, .velocity).?.x, 122.0);
+    try testing.expectEqual(reg.get(ent1, .velocity).?.y, 10.4);
+
+    var entity_cache = try std.ArrayList(Reg.Entity).initCapacity(testing.allocator, reg.entityCount());
+    defer entity_cache.deinit();
 
     const stdout = std.io.getStdOut().writer();
+    try stdout.writeByte('\n');
 
-    try stdout.writeByte('\n');
-    try reg.write(stdout, entities[0]);
-    try stdout.writeByte('\n');
-    try reg.write(stdout, entities[1]);
-    try stdout.writeByte('\n');
-    try reg.write(stdout, entity2);
-    try stdout.writeByte('\n');
-    try reg.write(stdout, entity3);
-    try stdout.writeByte('\n');
+    const view = try reg.entityViewArrayList(&entity_cache, .{ .require_any = .{ .position = true } });
+    for (view[0..]) |ent| {
+        try reg.writeEntity(ent, stdout, .{
+            .prefix = .entity_id,
+            .newline_indentation = .{ .spaces = .{ .depth = 0 } },
+        });
+        try stdout.writeByte('\n');
+    }
 }

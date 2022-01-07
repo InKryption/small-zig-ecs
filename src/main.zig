@@ -16,7 +16,7 @@ const TypeInfo = builtin.TypeInfo;
 /// an arbitrary row in the component columns. The index column is indexed by entity ids, which then indicates which
 /// row is associated with an entity id, allowing for arbitrary ordering of data, whilst ensuring that an entity id
 /// is never invalidated, up until it is destroyed.
-pub fn BasicRegistry(comptime S: type) type {
+pub fn BasicStructRegistry(comptime S: type) type {
     if (@typeInfo(S) != .Struct) @compileError("Expected a Struct type.");
     return struct {
         const Self = @This();
@@ -94,7 +94,7 @@ pub fn BasicRegistry(comptime S: type) type {
                 assert(reg.entityIsAlive(entity));
                 const index = reg.getEntityComponentsIndex(entity);
                 const flags = reg.getSliceOfComponentFlags(component);
-                
+
                 assert(flags[index]);
                 const ptr = reg.getPtr(entity, component).?;
                 const val = ptr.*;
@@ -141,20 +141,23 @@ pub fn BasicRegistry(comptime S: type) type {
                 comptime options: WriteEntityOptions,
             ) @TypeOf(writer).Error!void {
                 const component_names = comptime enums.values(ComponentName);
-                const eol: []const u8 = comptime switch (options.eol) { .lf => "\n", .crlf => "\n\r" };
+                const eol: []const u8 = comptime switch (options.eol) {
+                    .lf => "\n",
+                    .crlf => "\n\r",
+                };
                 const indentation_char_stride = if (options.newline_indentation) |nli| switch (nli) {
                     .tabs => 1,
                     .spaces => |spaces| spaces.count,
                 };
                 const indentation: []const u8 = if (options.newline_indentation) |nli| switch (nli) {
-                    .tabs => |tabs|  &([_]u8{ '\t' } ** (tabs + 1)),
-                    .spaces => |spaces| &(([_]u8{ ' ' } ** spaces.count) ** (spaces.depth + 1)),
+                    .tabs => |tabs| &([_]u8{'\t'} ** (tabs + 1)),
+                    .spaces => |spaces| &(([_]u8{' '} ** spaces.count) ** (spaces.depth + 1)),
                 } else "";
 
                 if (indentation.len != 0) try writer.writeAll(indentation[indentation_char_stride..]);
 
                 if (comptime options.prefix) |prefix| switch (prefix) {
-                    .entity_id => try writer.print("{}", .{ entity }),
+                    .entity_id => try writer.print("{}", .{entity}),
                     .period => try writer.writeByte('.'),
                 };
 
@@ -175,7 +178,7 @@ pub fn BasicRegistry(comptime S: type) type {
                     if (entity.get(reg, name)) |val| {
                         try writer.print(space_or_indentation ++ ".{s} = {" ++ format_spec ++ "}," ++ after_field, .{ @tagName(name), val });
                     } else if (options.null_components) {
-                        try writer.print(space_or_indentation ++ ".{s} = null," ++ after_field, .{ @tagName(name) });
+                        try writer.print(space_or_indentation ++ ".{s} = null," ++ after_field, .{@tagName(name)});
                     }
                 }
 
@@ -206,7 +209,7 @@ pub fn BasicRegistry(comptime S: type) type {
         }
 
         pub fn destroy(self: *Self, entity: Entity) void {
-            self.destroyMany(&[_]Entity{ entity });
+            self.destroyMany(&[_]Entity{entity});
         }
 
         pub fn createAssumeCapacity(self: *Self) Entity {
@@ -393,11 +396,11 @@ pub fn BasicRegistry(comptime S: type) type {
         }
 
         const ComponentType = meta_util.ComponentType;
-        const meta_util = BasicRegistryMetaUtil(S);
+        const meta_util = BasicStructRegistryMetaUtil(S);
     };
 }
 
-fn BasicRegistryMetaUtil(comptime S: type) type {
+fn BasicStructRegistryMetaUtil(comptime S: type) type {
     return struct {
         const DataStore = std.MultiArrayList(EntityDataStruct);
 
@@ -486,13 +489,11 @@ fn BasicRegistryMetaUtil(comptime S: type) type {
             const name_str = generated_field_type.prefix() ++ @tagName(component_name);
             return @field(FieldName, name_str);
         }
-
-        
     };
 }
 
-test "BasicRegistry" {
-    const Reg = BasicRegistry(struct {
+test "BasicStructRegistry" {
+    const Reg = BasicStructRegistry(struct {
         position: Position,
         velocity: Velocity,
 
